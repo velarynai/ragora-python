@@ -2,20 +2,20 @@
 
 Official Python SDK for the [Ragora](https://ragora.app) RAG API. Build AI-powered knowledge bases with semantic search and chat completions.
 
-[![PyPI version](https://badge.fury.io/py/ragora.svg)](https://pypi.org/project/ragora/)
+[![PyPI version](https://badge.fury.io/py/ragora-sdk.svg)](https://pypi.org/project/ragora-sdk/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Installation
 
 ```bash
-pip install ragora
+pip install ragora-sdk
 ```
 
 Or with uv:
 
 ```bash
-uv add ragora
+uv add ragora-sdk
 ```
 
 ## Quick Start

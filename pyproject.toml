@@ -1,5 +1,5 @@
 [project]
-name = "ragora"
+name = "ragora-sdk"
 dynamic = ["version"]
 description = "Official Python SDK for the Ragora RAG API - Build AI-powered knowledge bases"
 readme = "README.md"
