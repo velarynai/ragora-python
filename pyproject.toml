@@ -1,0 +1,85 @@
+[project]
+name = "ragora"
+dynamic = ["version"]
+description = "Official Python SDK for the Ragora RAG API - Build AI-powered knowledge bases"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ragora", email = "support@ragora.app" }]
+keywords = [
+    "ragora",
+    "rag",
+    "retrieval-augmented-generation",
+    "ai",
+    "llm",
+    "knowledge-base",
+    "vector-search",
+    "embeddings",
+    "sdk",
+    "api",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+agentic = [
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langchain-anthropic>=0.2.0",
+    "langchain-ollama>=0.2.0",
+    "langgraph-checkpoint-sqlite>=1.0.0",
+    "aiosqlite>=0.20.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+all = [
+    "ragora[agentic,dev]",
+]
+
+[project.urls]
+Homepage = "https://ragora.app"
+Documentation = "https://docs.ragora.app"
+Repository = "https://github.com/velarynai/ragora-python"
+Changelog = "https://github.com/velarynai/ragora-python/blob/main/CHANGELOG.md"
+
+[project.scripts]
+ragora-chat = "examples.agentic_rag.chat:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "ragora/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ragora"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
