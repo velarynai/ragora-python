@@ -151,6 +151,58 @@ class RagoraClient:
 
         return response.json(), metadata
 
+    @staticmethod
+    def _parse_search_results(raw_results: Any) -> list[SearchResult]:
+        """Normalize API result chunks into SearchResult models."""
+        if not isinstance(raw_results, list):
+            return []
+
+        results: list[SearchResult] = []
+        for raw in raw_results:
+            if not isinstance(raw, dict):
+                continue
+
+            raw_id = raw.get("id", raw.get("chunk_id", ""))
+            if raw_id is None:
+                raw_id = ""
+
+            content = raw.get("text", raw.get("content", ""))
+            if content is None:
+                content = ""
+
+            score_raw = raw.get("score", 0.0)
+            try:
+                score = float(score_raw)
+            except (TypeError, ValueError):
+                score = 0.0
+
+            metadata = raw.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            results.append(
+                SearchResult(
+                    id=str(raw_id),
+                    content=str(content),
+                    score=score,
+                    metadata=metadata,
+                    document_id=raw.get("document_id"),
+                    collection_id=raw.get("collection_id"),
+                )
+            )
+
+        return results
+
+    @classmethod
+    def _extract_chat_sources(cls, payload: dict[str, Any]) -> list[SearchResult]:
+        """Extract chat sources from Ragora's extended or legacy response shapes."""
+        ragora_stats = payload.get("ragora_stats")
+        if isinstance(ragora_stats, dict):
+            nested_sources = ragora_stats.get("sources")
+            if isinstance(nested_sources, list):
+                return cls._parse_search_results(nested_sources)
+        return cls._parse_search_results(payload.get("sources", []))
+
     async def _upload_file(
         self,
         path: str,
@@ -231,6 +283,17 @@ class RagoraClient:
         top_k: int = 5,
         threshold: Optional[float] = None,
         filters: Optional[dict[str, Any]] = None,
+        source_type: Optional[list[str]] = None,
+        source_name: Optional[list[str]] = None,
+        version: Optional[list[str]] = None,
+        version_mode: Optional[str] = None,
+        document_keys: Optional[list[str]] = None,
+        custom_tags: Optional[list[str]] = None,
+        domain: Optional[list[str]] = None,
+        domain_filter_mode: Optional[str] = None,
+        enable_reranker: Optional[bool] = None,
+        graph_filter: Optional[dict[str, Any]] = None,
+        temporal_filter: Optional[dict[str, Any]] = None,
     ) -> SearchResponse:
         """
         Search for relevant documents.
@@ -241,6 +304,17 @@ class RagoraClient:
             top_k: Number of results to return (default: 5)
             threshold: Minimum relevance score (0-1)
             filters: Metadata filters (MongoDB-style operators)
+            source_type: Filter by source type (e.g., ["upload", "html", "youtube"])
+            source_name: Filter by source name
+            version: Filter by document version tags
+            version_mode: Version mode: "latest" or "all"
+            document_keys: Filter by specific document keys
+            custom_tags: Filter by custom tags (OR logic)
+            domain: Filter by domain (e.g., ["legal", "medical", "software_docs"])
+            domain_filter_mode: "preferred" (boost, default) or "strict" (filter)
+            enable_reranker: Toggle reranker for result refinement (default: false)
+            graph_filter: Knowledge graph filter (e.g., {"entities": ["john"], "entity_type": "PERSON"})
+            temporal_filter: Temporal filter (e.g., {"since": "2024-01-01T00:00:00Z", "recency_weight": 0.5})
 
         Returns:
             SearchResponse with results and metadata
@@ -255,23 +329,58 @@ class RagoraClient:
             payload["threshold"] = threshold
         if filters is not None:
             payload["filters"] = filters
+        if source_type is not None:
+            payload["source_type"] = source_type
+        if source_name is not None:
+            payload["source_name"] = source_name
+        if version is not None:
+            payload["version"] = version
+        if version_mode is not None:
+            payload["version_mode"] = version_mode
+        if document_keys is not None:
+            payload["document_keys"] = document_keys
+        if custom_tags is not None:
+            payload["custom_tags"] = custom_tags
+        if domain is not None:
+            payload["domain"] = domain
+        if domain_filter_mode is not None:
+            payload["domain_filter_mode"] = domain_filter_mode
+        if enable_reranker is not None:
+            payload["enable_reranker"] = enable_reranker
+        if graph_filter is not None:
+            payload["graph_filter"] = graph_filter
+        if temporal_filter is not None:
+            payload["temporal_filter"] = temporal_filter
         
         data, metadata = await self._request("POST", "/v1/retrieve", json_data=payload)
         
-        results = [
-            SearchResult(
-                id=r.get("id", ""),
-                content=r.get("text", r.get("content", "")),
-                score=r.get("score", 0.0),
-                metadata=r.get("metadata", {}),
-                document_id=r.get("document_id"),
-                collection_id=r.get("collection_id"),
-            )
-            for r in data.get("results", [])
-        ]
+        results = self._parse_search_results(data.get("results", []))
+
+        fragments = data.get("fragments")
+        if not isinstance(fragments, list):
+            fragments = []
+
+        knowledge_graph = data.get("knowledge_graph")
+        if not isinstance(knowledge_graph, dict):
+            knowledge_graph = None
+
+        global_graph_context = data.get("global_graph_context")
+        if not isinstance(global_graph_context, dict):
+            global_graph_context = None
+
+        graph_debug = data.get("graph_debug")
+        if not isinstance(graph_debug, dict):
+            graph_debug = None
         
         return SearchResponse(
+            object=data.get("object"),
             results=results,
+            fragments=fragments,
+            system_instruction=data.get("system_instruction"),
+            knowledge_graph=knowledge_graph,
+            global_graph_context=global_graph_context,
+            knowledge_graph_summary=data.get("knowledge_graph_summary"),
+            graph_debug=graph_debug,
             query=query,
             total=len(results),
             **metadata,
@@ -283,10 +392,18 @@ class RagoraClient:
         self,
         messages: list[dict[str, str]],
         collection_id: Optional[str] = None,
+        product_ids: Optional[list[str]] = None,
         model: str = "gpt-4o-mini",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         top_k: Optional[int] = None,
+        source_type: Optional[list[str]] = None,
+        source_name: Optional[list[str]] = None,
+        version: Optional[list[str]] = None,
+        custom_tags: Optional[list[str]] = None,
+        filters: Optional[dict[str, Any]] = None,
+        enable_reranker: Optional[bool] = None,
+        metadata: Optional[dict[str, str]] = None,
     ) -> ChatResponse:
         """
         Generate a chat completion with RAG context.
@@ -294,10 +411,18 @@ class RagoraClient:
         Args:
             messages: Chat messages (role/content dicts)
             collection_id: Collection ID or slug (omit to use all accessible collections)
-            model: Model to use (default: gpt-4o-mini)
+            product_ids: Product IDs to search
+            model: Model to use via OpenRouter (e.g., "openai/gpt-4o-mini", "anthropic/claude-4-5-sonnet")
             temperature: Sampling temperature (0-2)
             max_tokens: Maximum tokens to generate
-            top_k: Number of chunks to retrieve for context
+            top_k: Number of chunks to retrieve for context (default: 5, max: 20)
+            source_type: Filter by source type
+            source_name: Filter by source name
+            version: Filter by document version
+            custom_tags: Filter by custom tags
+            filters: Metadata filters (MongoDB-style operators)
+            enable_reranker: Toggle reranker (default: false)
+            metadata: Request metadata for analytics (source, installation_id, channel_id, requester_id)
 
         Returns:
             ChatResponse with completion and sources
@@ -310,10 +435,26 @@ class RagoraClient:
         }
         if collection_id is not None:
             payload["collection_ids"] = [collection_id]
+        if product_ids is not None:
+            payload["product_ids"] = product_ids
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         if top_k is not None:
             payload["top_k"] = top_k
+        if source_type is not None:
+            payload["source_type"] = source_type
+        if source_name is not None:
+            payload["source_name"] = source_name
+        if version is not None:
+            payload["version"] = version
+        if custom_tags is not None:
+            payload["custom_tags"] = custom_tags
+        if filters is not None:
+            payload["filters"] = filters
+        if enable_reranker is not None:
+            payload["enable_reranker"] = enable_reranker
+        if metadata is not None:
+            payload["metadata"] = metadata
         
         data, metadata = await self._request("POST", "/v1/chat/completions", json_data=payload)
         
@@ -329,15 +470,7 @@ class RagoraClient:
             for c in data.get("choices", [])
         ]
         
-        sources = [
-            SearchResult(
-                id=s.get("id", ""),
-                content=s.get("text", s.get("content", "")),
-                score=s.get("score", 0.0),
-                metadata=s.get("metadata", {}),
-            )
-            for s in data.get("sources", [])
-        ]
+        sources = self._extract_chat_sources(data)
 
         return ChatResponse(
             id=data.get("id", ""),
@@ -354,10 +487,18 @@ class RagoraClient:
         self,
         messages: list[dict[str, str]],
         collection_id: Optional[str] = None,
+        product_ids: Optional[list[str]] = None,
         model: str = "gpt-4o-mini",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         top_k: Optional[int] = None,
+        source_type: Optional[list[str]] = None,
+        source_name: Optional[list[str]] = None,
+        version: Optional[list[str]] = None,
+        custom_tags: Optional[list[str]] = None,
+        filters: Optional[dict[str, Any]] = None,
+        enable_reranker: Optional[bool] = None,
+        metadata: Optional[dict[str, str]] = None,
     ) -> AsyncIterator[ChatStreamChunk]:
         """
         Stream a chat completion with RAG context.
@@ -365,10 +506,18 @@ class RagoraClient:
         Args:
             messages: Chat messages (role/content dicts)
             collection_id: Collection ID or slug (omit to use all accessible collections)
-            model: Model to use (default: gpt-4o-mini)
+            product_ids: Product IDs to search
+            model: Model to use via OpenRouter (e.g., "openai/gpt-4o-mini", "anthropic/claude-4-5-sonnet")
             temperature: Sampling temperature (0-2)
             max_tokens: Maximum tokens to generate
-            top_k: Number of chunks to retrieve for context
+            top_k: Number of chunks to retrieve for context (default: 5, max: 20)
+            source_type: Filter by source type
+            source_name: Filter by source name
+            version: Filter by document version
+            custom_tags: Filter by custom tags
+            filters: Metadata filters (MongoDB-style operators)
+            enable_reranker: Toggle reranker (default: false)
+            metadata: Request metadata for analytics (source, installation_id, channel_id, requester_id)
 
         Yields:
             ChatStreamChunk with content deltas
@@ -383,10 +532,26 @@ class RagoraClient:
         }
         if collection_id is not None:
             payload["collection_ids"] = [collection_id]
+        if product_ids is not None:
+            payload["product_ids"] = product_ids
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         if top_k is not None:
             payload["top_k"] = top_k
+        if source_type is not None:
+            payload["source_type"] = source_type
+        if source_name is not None:
+            payload["source_name"] = source_name
+        if version is not None:
+            payload["version"] = version
+        if custom_tags is not None:
+            payload["custom_tags"] = custom_tags
+        if filters is not None:
+            payload["filters"] = filters
+        if enable_reranker is not None:
+            payload["enable_reranker"] = enable_reranker
+        if metadata is not None:
+            payload["metadata"] = metadata
         
         async with client.stream(
             "POST",
@@ -397,41 +562,87 @@ class RagoraClient:
                 # Read the full response for error handling
                 await response.aread()
                 await self._handle_error(response)
-            
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                
-                data_str = line[6:]  # Remove "data: " prefix
+
+            event_name = "message"
+            data_lines: list[str] = []
+
+            def parse_sse_event(
+                current_event: str,
+                current_data_lines: list[str],
+            ) -> tuple[Optional[ChatStreamChunk], bool]:
+                if not current_data_lines:
+                    return None, False
+
+                data_str = "\n".join(current_data_lines)
                 if data_str == "[DONE]":
-                    break
-                
+                    return None, True
+
                 try:
-                    data = json.loads(data_str)
-                    delta = data.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content", "")
-                    finish_reason = data.get("choices", [{}])[0].get("finish_reason")
-                    
-                    # Sources may be included in the final chunk
-                    sources = []
-                    if "sources" in data:
-                        sources = [
-                            SearchResult(
-                                id=s.get("id", ""),
-                                content=s.get("text", s.get("content", "")),
-                                score=s.get("score", 0.0),
-                                metadata=s.get("metadata", {}),
-                            )
-                            for s in data["sources"]
-                        ]
-                    
-                    yield ChatStreamChunk(
-                        content=content,
+                    payload = json.loads(data_str)
+                except json.JSONDecodeError:
+                    return None, False
+
+                if not isinstance(payload, dict):
+                    return None, False
+
+                if current_event in {"ragora_metadata", "ragora_complete"}:
+                    sources = self._extract_chat_sources(payload)
+                    if not sources:
+                        return None, False
+                    return ChatStreamChunk(content="", finish_reason=None, sources=sources), False
+
+                choices = payload.get("choices", [])
+                choice = choices[0] if isinstance(choices, list) and choices else {}
+                if not isinstance(choice, dict):
+                    choice = {}
+
+                delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    delta = {}
+
+                content = delta.get("content", "")
+                if content is None:
+                    content = ""
+
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None and not isinstance(finish_reason, str):
+                    finish_reason = str(finish_reason)
+
+                sources = self._extract_chat_sources(payload)
+                if not content and finish_reason is None and not sources:
+                    return None, False
+
+                return (
+                    ChatStreamChunk(
+                        content=str(content),
                         finish_reason=finish_reason,
                         sources=sources,
-                    )
-                except json.JSONDecodeError:
+                    ),
+                    False,
+                )
+
+            async for line in response.aiter_lines():
+                if line == "":
+                    chunk, done = parse_sse_event(event_name, data_lines)
+                    data_lines = []
+                    event_name = "message"
+                    if chunk is not None:
+                        yield chunk
+                    if done:
+                        break
                     continue
+
+                if line.startswith("event:"):
+                    event_name = line[6:].strip() or "message"
+                    continue
+
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+
+            if data_lines:
+                chunk, _ = parse_sse_event(event_name, data_lines)
+                if chunk is not None:
+                    yield chunk
     
     # --- Credits ---
     
@@ -575,6 +786,7 @@ class RagoraClient:
         name: Optional[str] = None,
         description: Optional[str] = None,
         slug: Optional[str] = None,
+        capability_config: Optional[dict[str, Any]] = None,
     ) -> Collection:
         """
         Update an existing collection.
@@ -584,6 +796,7 @@ class RagoraClient:
             name: New name (optional)
             description: New description (optional)
             slug: New slug (optional)
+            capability_config: MCP tool configuration (optional)
 
         Returns:
             Updated collection
@@ -595,6 +808,8 @@ class RagoraClient:
             payload["description"] = description
         if slug is not None:
             payload["slug"] = slug
+        if capability_config is not None:
+            payload["capability_config"] = capability_config
 
         data, _ = await self._request(
             "PATCH", f"/v1/collections/{collection_id}", json_data=payload

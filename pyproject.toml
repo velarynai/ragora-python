@@ -63,6 +63,7 @@ Changelog = "https://github.com/velarynai/ragora-python/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ragora-chat = "examples.agentic_rag.chat:run"
+ragora-smoke = "ragora.smoke:main"
 
 [build-system]
 requires = ["hatchling"]

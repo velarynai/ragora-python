@@ -18,6 +18,33 @@ Or with uv:
 uv add ragora-sdk
 ```
 
+## Release Smoke Check
+
+Run a quick pre-release smoke check that:
+- builds the package (if `build` is installed),
+- validates dist metadata (if `twine` is installed),
+- executes a curated set of examples against a mocked client (no network/API key required).
+
+```bash
+python -m ragora.smoke
+```
+
+Or via CLI entrypoint:
+
+```bash
+ragora-smoke
+```
+
+Useful options:
+
+```bash
+# skip build/twine phase
+python -m ragora.smoke --skip-prepare
+
+# run a subset of examples
+python -m ragora.smoke --examples search.py,credits.py,listings.py
+```
+
 ## Quick Start
 
 ```python

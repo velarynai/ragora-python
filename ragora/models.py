@@ -36,7 +36,14 @@ class SearchResult(BaseModel):
 class SearchResponse(ResponseMetadata):
     """Search API response."""
     
+    object: Optional[str] = Field(None, description="Response object type")
     results: list[SearchResult] = Field(default_factory=list, description="Search results")
+    fragments: list[dict[str, Any]] = Field(default_factory=list, description="Agent-native retrieval fragments")
+    system_instruction: Optional[str] = Field(None, description="Suggested citation instruction")
+    knowledge_graph: Optional[dict[str, Any]] = Field(None, description="Cross-chunk graph context")
+    global_graph_context: Optional[dict[str, Any]] = Field(None, description="Backward-compatible graph context alias")
+    knowledge_graph_summary: Optional[str] = Field(None, description="Human-readable graph summary")
+    graph_debug: Optional[dict[str, Any]] = Field(None, description="Graph enrichment debug metadata")
     query: str = Field(..., description="Original query")
     total: int = Field(0, description="Total matching results")
 
@@ -69,7 +76,7 @@ class ChatResponse(ResponseMetadata):
     usage: Optional[dict[str, int]] = Field(None, description="Token usage")
     
     # RAG-specific fields
-    sources: list[SearchResult] = Field(default_factory=list, description="Source documents used")
+    sources: list[SearchResult] = Field(default_factory=list, description="Source documents used (flattened from ragora_stats.sources)")
 
 
 class ChatStreamChunk(BaseModel):
@@ -77,7 +84,7 @@ class ChatStreamChunk(BaseModel):
     
     content: str = Field("", description="Content delta")
     finish_reason: Optional[str] = Field(None, description="Why generation stopped")
-    sources: list[SearchResult] = Field(default_factory=list, description="Sources (only in final chunk)")
+    sources: list[SearchResult] = Field(default_factory=list, description="Sources from Ragora SSE metadata events")
 
 
 # --- Credit Models ---
@@ -123,7 +130,7 @@ class Document(BaseModel):
 
     id: str = Field(..., description="Document ID")
     filename: str = Field(..., description="Original filename")
-    status: str = Field(..., description="Processing status: pending, processing, completed, failed")
+    status: str = Field(..., description="Processing status: pending, uploading, processing, retrying, completed, failed, unsupported")
     mime_type: Optional[str] = Field(None, description="MIME type")
     size_bytes: Optional[int] = Field(None, description="File size in bytes")
     vector_count: int = Field(0, description="Number of vectors generated")
