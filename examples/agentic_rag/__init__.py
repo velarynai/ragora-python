@@ -1,24 +1,11 @@
 """
-Agentic RAG - LangGraph-based intelligent retrieval system.
+Agentic RAG — powered by Ragora's agent chat system.
 
-This module provides a production-ready agentic RAG implementation with:
-- Multi-step intelligent retrieval
-- Query analysis and decomposition  
-- Context evaluation and refinement
-- Streaming responses
-- Conversation persistence
-- Model-agnostic design (OpenAI, Anthropic, etc.)
+All RAG logic (knowledge search, memory management, compaction, tool calls)
+is handled server-side. This example shows how to create an agent and chat
+with it using minimal code.
 """
 
-from .agent import AgenticRAGAgent, create_agent
-from .state import AgentState, SearchResult, Message
-from .config import AgentConfig
+from .agent import AgenticRAGAgent
 
-__all__ = [
-    "AgenticRAGAgent",
-    "create_agent", 
-    "AgentState",
-    "SearchResult",
-    "Message",
-    "AgentConfig",
-]
+__all__ = ["AgenticRAGAgent"]

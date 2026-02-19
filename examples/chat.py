@@ -28,7 +28,7 @@ async def main():
             messages=[
                 {"role": "user", "content": "What is RAG and how does it work?"}
             ],
-            model="gpt-4o-mini",
+            model="google/gemini-2.5-flash",
             temperature=0.7,
         )
         
@@ -55,7 +55,7 @@ async def main():
             messages=[
                 {"role": "user", "content": "Explain the benefits of using RAG over fine-tuning"}
             ],
-            model="gpt-4o-mini",
+            model="google/gemini-2.5-flash",
             temperature=0.7,
         ):
             print(chunk.content, end="", flush=True)

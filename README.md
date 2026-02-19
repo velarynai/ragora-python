@@ -222,7 +222,7 @@ response = await client.chat(
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Explain RAG"}
     ],
-    model="gpt-4o-mini",    # optional
+    model="google/gemini-2.5-flash",    # optional
     temperature=0.7,         # optional
     max_tokens=1000,         # optional
     system_prompt="Custom system prompt"  # optional

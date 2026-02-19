@@ -239,6 +239,91 @@ class MarketplaceList(ResponseMetadata):
     has_more: bool = Field(False, description="More pages available")
 
 
+# --- Agent Models ---
+
+
+class Agent(BaseModel):
+    """An AI agent."""
+
+    id: str = Field(..., description="Agent ID")
+    org_id: str = Field(..., description="Organization ID")
+    name: str = Field(..., description="Agent name")
+    type: str = Field("support", description="Agent type")
+    system_prompt: str = Field("", description="System prompt")
+    collection_ids: list[str] = Field(default_factory=list, description="Linked collection IDs")
+    memory_config: dict[str, Any] = Field(default_factory=dict, description="Memory configuration")
+    budget_config: dict[str, Any] = Field(default_factory=dict, description="Budget configuration")
+    status: str = Field("active", description="Agent status")
+    created_at: Optional[str] = Field(None, description="Creation timestamp")
+    updated_at: Optional[str] = Field(None, description="Last update timestamp")
+
+
+class AgentList(ResponseMetadata):
+    """List of agents response."""
+
+    agents: list[Agent] = Field(default_factory=list, description="Agents")
+
+
+class AgentChatResponse(ResponseMetadata):
+    """Agent chat response."""
+
+    message: str = Field(..., description="Assistant response")
+    session_id: str = Field(..., description="Session ID")
+    citations: list[Any] = Field(default_factory=list, description="Source citations")
+    stats: Optional[dict[str, Any]] = Field(None, description="Usage statistics")
+
+
+class AgentChatStreamChunk(BaseModel):
+    """A streaming agent chat chunk."""
+
+    content: str = Field("", description="Content delta")
+    session_id: Optional[str] = Field(None, description="Session ID")
+    stats: Optional[dict[str, Any]] = Field(None, description="Usage statistics")
+    done: bool = Field(False, description="Whether stream is complete")
+
+
+class AgentSession(BaseModel):
+    """An agent chat session."""
+
+    id: str = Field(..., description="Session ID")
+    agent_id: str = Field(..., description="Agent ID")
+    org_id: str = Field(..., description="Organization ID")
+    source: str = Field("", description="Session source")
+    source_key: Optional[str] = Field(None, description="Source key")
+    visitor_id: Optional[str] = Field(None, description="Visitor ID")
+    status: str = Field("open", description="Session status")
+    message_count: int = Field(0, description="Number of messages")
+    created_at: Optional[str] = Field(None, description="Creation timestamp")
+    updated_at: Optional[str] = Field(None, description="Last update timestamp")
+
+
+class AgentSessionList(ResponseMetadata):
+    """List of agent sessions response."""
+
+    sessions: list[AgentSession] = Field(default_factory=list, description="Sessions")
+    total: int = Field(0, description="Total count")
+
+
+class AgentMessage(BaseModel):
+    """A message in an agent session."""
+
+    id: str = Field(..., description="Message ID")
+    session_id: str = Field(..., description="Session ID")
+    role: str = Field(..., description="Message role: user or assistant")
+    content: str = Field(..., description="Message content")
+    latency_ms: Optional[int] = Field(None, description="Response latency in ms")
+    cost_usd: Optional[float] = Field(None, description="Cost in USD")
+    model: Optional[str] = Field(None, description="Model used")
+    created_at: Optional[str] = Field(None, description="Creation timestamp")
+
+
+class AgentSessionDetail(ResponseMetadata):
+    """Agent session with messages."""
+
+    session: AgentSession = Field(..., description="Session details")
+    messages: list[AgentMessage] = Field(default_factory=list, description="Session messages")
+
+
 # --- Error Models ---
 
 class APIErrorDetail(BaseModel):

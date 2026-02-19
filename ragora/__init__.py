@@ -7,6 +7,14 @@ A simple, async-first wrapper for the Ragora API.
 from .client import RagoraClient
 from .models import (
     APIError,
+    Agent,
+    AgentChatResponse,
+    AgentChatStreamChunk,
+    AgentList,
+    AgentMessage,
+    AgentSession,
+    AgentSessionDetail,
+    AgentSessionList,
     ChatChoice,
     ChatMessage,
     ChatResponse,
@@ -27,7 +35,7 @@ from .models import (
     UploadResponse,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = [
     # Client
     "RagoraClient",
@@ -54,6 +62,15 @@ __all__ = [
     "Listing",
     # Credits
     "CreditBalance",
+    # Agents
+    "Agent",
+    "AgentList",
+    "AgentChatResponse",
+    "AgentChatStreamChunk",
+    "AgentSession",
+    "AgentSessionList",
+    "AgentMessage",
+    "AgentSessionDetail",
     # Errors
     "APIError",
     "RagoraException",

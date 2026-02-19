@@ -13,6 +13,14 @@ import httpx
 
 from .models import (
     APIError,
+    Agent,
+    AgentChatResponse,
+    AgentChatStreamChunk,
+    AgentList,
+    AgentMessage,
+    AgentSession,
+    AgentSessionDetail,
+    AgentSessionList,
     ChatChoice,
     ChatMessage,
     ChatResponse,
@@ -393,7 +401,7 @@ class RagoraClient:
         messages: list[dict[str, str]],
         collection_id: Optional[str] = None,
         product_ids: Optional[list[str]] = None,
-        model: str = "gpt-4o-mini",
+        model: str = "google/gemini-2.5-flash",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         top_k: Optional[int] = None,
@@ -412,7 +420,7 @@ class RagoraClient:
             messages: Chat messages (role/content dicts)
             collection_id: Collection ID or slug (omit to use all accessible collections)
             product_ids: Product IDs to search
-            model: Model to use via OpenRouter (e.g., "openai/gpt-4o-mini", "anthropic/claude-4-5-sonnet")
+            model: Model to use via OpenRouter (e.g., "openai/google/gemini-2.5-flash", "anthropic/claude-4-5-sonnet")
             temperature: Sampling temperature (0-2)
             max_tokens: Maximum tokens to generate
             top_k: Number of chunks to retrieve for context (default: 5, max: 20)
@@ -488,7 +496,7 @@ class RagoraClient:
         messages: list[dict[str, str]],
         collection_id: Optional[str] = None,
         product_ids: Optional[list[str]] = None,
-        model: str = "gpt-4o-mini",
+        model: str = "google/gemini-2.5-flash",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         top_k: Optional[int] = None,
@@ -507,7 +515,7 @@ class RagoraClient:
             messages: Chat messages (role/content dicts)
             collection_id: Collection ID or slug (omit to use all accessible collections)
             product_ids: Product IDs to search
-            model: Model to use via OpenRouter (e.g., "openai/gpt-4o-mini", "anthropic/claude-4-5-sonnet")
+            model: Model to use via OpenRouter (e.g., "openai/google/gemini-2.5-flash", "anthropic/claude-4-5-sonnet")
             temperature: Sampling temperature (0-2)
             max_tokens: Maximum tokens to generate
             top_k: Number of chunks to retrieve for context (default: 5, max: 20)
@@ -856,6 +864,17 @@ class RagoraClient:
         file_content: bytes,
         filename: str,
         collection_id: Optional[str] = None,
+        relative_path: Optional[str] = None,
+        release_tag: Optional[str] = None,
+        version: Optional[str] = None,
+        effective_at: Optional[str] = None,
+        document_time: Optional[str] = None,
+        expires_at: Optional[str] = None,
+        source_type: Optional[str] = None,
+        source_name: Optional[str] = None,
+        custom_tags: Optional[list[str]] = None,
+        domain: Optional[str] = None,
+        scan_mode: Optional[str] = None,
     ) -> UploadResponse:
         """
         Upload a document to a collection.
@@ -864,13 +883,48 @@ class RagoraClient:
             file_content: File content as bytes
             filename: Original filename
             collection_id: Target collection ID or slug (uses default if not provided)
+            relative_path: Relative path for directory-style uploads
+            release_tag: Release tag for versioned documents
+            version: Document version string
+            effective_at: When the document becomes effective (ISO 8601)
+            document_time: Document timestamp for temporal search (ISO 8601)
+            expires_at: When the document expires (ISO 8601)
+            source_type: Source type (e.g., "sec_filing", "web_crawl")
+            source_name: Source name (e.g., "sec-edgar")
+            custom_tags: List of custom tags for filtering
+            domain: Content domain (e.g., "financial", "legal")
+            scan_mode: Scan mode for processing
 
         Returns:
             Upload response with document ID
         """
+        import json
+
         form_data: dict[str, Any] = {}
         if collection_id is not None:
             form_data["collection_id"] = collection_id
+        if relative_path is not None:
+            form_data["relative_path"] = relative_path
+        if release_tag is not None:
+            form_data["release_tag"] = release_tag
+        if version is not None:
+            form_data["version"] = version
+        if effective_at is not None:
+            form_data["effective_at"] = effective_at
+        if document_time is not None:
+            form_data["document_time"] = document_time
+        if expires_at is not None:
+            form_data["expires_at"] = expires_at
+        if source_type is not None:
+            form_data["source_type"] = source_type
+        if source_name is not None:
+            form_data["source_name"] = source_name
+        if custom_tags is not None:
+            form_data["custom_tags"] = json.dumps(custom_tags)
+        if domain is not None:
+            form_data["domain"] = domain
+        if scan_mode is not None:
+            form_data["scan_mode"] = scan_mode
 
         data, metadata = await self._upload_file(
             "/v1/documents",
@@ -892,6 +946,17 @@ class RagoraClient:
         self,
         file_path: str,
         collection_id: Optional[str] = None,
+        relative_path: Optional[str] = None,
+        release_tag: Optional[str] = None,
+        version: Optional[str] = None,
+        effective_at: Optional[str] = None,
+        document_time: Optional[str] = None,
+        expires_at: Optional[str] = None,
+        source_type: Optional[str] = None,
+        source_name: Optional[str] = None,
+        custom_tags: Optional[list[str]] = None,
+        domain: Optional[str] = None,
+        scan_mode: Optional[str] = None,
     ) -> UploadResponse:
         """
         Upload a file from disk to a collection.
@@ -899,6 +964,17 @@ class RagoraClient:
         Args:
             file_path: Path to the file on disk
             collection_id: Target collection ID or slug (uses default if not provided)
+            relative_path: Relative path for directory-style uploads
+            release_tag: Release tag for versioned documents
+            version: Document version string
+            effective_at: When the document becomes effective (ISO 8601)
+            document_time: Document timestamp for temporal search (ISO 8601)
+            expires_at: When the document expires (ISO 8601)
+            source_type: Source type (e.g., "sec_filing", "web_crawl")
+            source_name: Source name (e.g., "sec-edgar")
+            custom_tags: List of custom tags for filtering
+            domain: Content domain (e.g., "financial", "legal")
+            scan_mode: Scan mode for processing
 
         Returns:
             Upload response with document ID
@@ -913,6 +989,17 @@ class RagoraClient:
             file_content=file_content,
             filename=filename,
             collection_id=collection_id,
+            relative_path=relative_path,
+            release_tag=release_tag,
+            version=version,
+            effective_at=effective_at,
+            document_time=document_time,
+            expires_at=expires_at,
+            source_type=source_type,
+            source_name=source_name,
+            custom_tags=custom_tags,
+            domain=domain,
+            scan_mode=scan_mode,
         )
 
     async def get_document_status(self, document_id: str) -> DocumentStatus:
@@ -1155,4 +1242,443 @@ class RagoraClient:
             categories=data.get("categories"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
+        )
+
+    # --- Agents ---
+
+    async def create_agent(
+        self,
+        name: str,
+        collection_ids: list[str],
+        type: str = "support",
+        system_prompt: Optional[str] = None,
+        memory_config: Optional[dict[str, Any]] = None,
+        budget_config: Optional[dict[str, Any]] = None,
+    ) -> Agent:
+        """
+        Create a new agent.
+
+        Args:
+            name: Agent name
+            collection_ids: Collection IDs to link
+            type: Agent type (default: "support")
+            system_prompt: System prompt for the agent
+            memory_config: Memory configuration
+            budget_config: Budget configuration
+
+        Returns:
+            Created agent
+        """
+        payload: dict[str, Any] = {
+            "name": name,
+            "type": type,
+            "collection_ids": collection_ids,
+        }
+        if system_prompt is not None:
+            payload["system_prompt"] = system_prompt
+        if memory_config is not None:
+            payload["memory_config"] = memory_config
+        if budget_config is not None:
+            payload["budget_config"] = budget_config
+
+        data, _ = await self._request("POST", "/v1/agents", json_data=payload)
+
+        return Agent(
+            id=data.get("id", ""),
+            org_id=data.get("org_id", ""),
+            name=data.get("name", ""),
+            type=data.get("type", "support"),
+            system_prompt=data.get("system_prompt", ""),
+            collection_ids=data.get("collection_ids", []),
+            memory_config=data.get("memory_config", {}),
+            budget_config=data.get("budget_config", {}),
+            status=data.get("status", "active"),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+    async def list_agents(self) -> AgentList:
+        """
+        List all agents.
+
+        Returns:
+            AgentList with agents
+        """
+        data, metadata = await self._request("GET", "/v1/agents")
+
+        agents = [
+            Agent(
+                id=a.get("id", ""),
+                org_id=a.get("org_id", ""),
+                name=a.get("name", ""),
+                type=a.get("type", "support"),
+                system_prompt=a.get("system_prompt", ""),
+                collection_ids=a.get("collection_ids", []),
+                memory_config=a.get("memory_config", {}),
+                budget_config=a.get("budget_config", {}),
+                status=a.get("status", "active"),
+                created_at=a.get("created_at"),
+                updated_at=a.get("updated_at"),
+            )
+            for a in data.get("agents", [])
+        ]
+
+        return AgentList(agents=agents, **metadata)
+
+    async def get_agent(self, agent_id: str) -> Agent:
+        """
+        Get an agent by ID.
+
+        Args:
+            agent_id: Agent ID
+
+        Returns:
+            Agent details
+        """
+        data, _ = await self._request("GET", f"/v1/agents/{agent_id}")
+
+        return Agent(
+            id=data.get("id", ""),
+            org_id=data.get("org_id", ""),
+            name=data.get("name", ""),
+            type=data.get("type", "support"),
+            system_prompt=data.get("system_prompt", ""),
+            collection_ids=data.get("collection_ids", []),
+            memory_config=data.get("memory_config", {}),
+            budget_config=data.get("budget_config", {}),
+            status=data.get("status", "active"),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+    async def update_agent(
+        self,
+        agent_id: str,
+        name: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        collection_ids: Optional[list[str]] = None,
+        memory_config: Optional[dict[str, Any]] = None,
+        budget_config: Optional[dict[str, Any]] = None,
+        status: Optional[str] = None,
+    ) -> Agent:
+        """
+        Update an agent.
+
+        Args:
+            agent_id: Agent ID
+            name: New name
+            system_prompt: New system prompt
+            collection_ids: New collection IDs
+            memory_config: New memory config
+            budget_config: New budget config
+            status: New status
+
+        Returns:
+            Updated agent
+        """
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if system_prompt is not None:
+            payload["system_prompt"] = system_prompt
+        if collection_ids is not None:
+            payload["collection_ids"] = collection_ids
+        if memory_config is not None:
+            payload["memory_config"] = memory_config
+        if budget_config is not None:
+            payload["budget_config"] = budget_config
+        if status is not None:
+            payload["status"] = status
+
+        data, _ = await self._request("PATCH", f"/v1/agents/{agent_id}", json_data=payload)
+
+        return Agent(
+            id=data.get("id", ""),
+            org_id=data.get("org_id", ""),
+            name=data.get("name", ""),
+            type=data.get("type", "support"),
+            system_prompt=data.get("system_prompt", ""),
+            collection_ids=data.get("collection_ids", []),
+            memory_config=data.get("memory_config", {}),
+            budget_config=data.get("budget_config", {}),
+            status=data.get("status", "active"),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+    async def delete_agent(self, agent_id: str) -> DeleteResponse:
+        """
+        Delete an agent.
+
+        Args:
+            agent_id: Agent ID
+
+        Returns:
+            Deletion confirmation
+        """
+        data, _ = await self._request("DELETE", f"/v1/agents/{agent_id}")
+
+        return DeleteResponse(
+            message=data.get("message", "Agent deleted"),
+            id=data.get("id", agent_id),
+        )
+
+    async def agent_chat(
+        self,
+        agent_id: str,
+        message: str,
+        session_id: Optional[str] = None,
+    ) -> AgentChatResponse:
+        """
+        Chat with an agent.
+
+        Args:
+            agent_id: Agent ID
+            message: User message
+            session_id: Session ID to continue a conversation
+
+        Returns:
+            AgentChatResponse with assistant message and session ID
+        """
+        payload: dict[str, Any] = {
+            "message": message,
+            "stream": False,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+
+        data, metadata = await self._request(
+            "POST", f"/v1/agents/{agent_id}/chat", json_data=payload
+        )
+
+        return AgentChatResponse(
+            message=data.get("message", ""),
+            session_id=data.get("session_id", ""),
+            citations=data.get("citations", []),
+            stats=data.get("stats"),
+            **metadata,
+        )
+
+    async def agent_chat_stream(
+        self,
+        agent_id: str,
+        message: str,
+        session_id: Optional[str] = None,
+    ) -> AsyncIterator[AgentChatStreamChunk]:
+        """
+        Stream a chat with an agent.
+
+        Args:
+            agent_id: Agent ID
+            message: User message
+            session_id: Session ID to continue a conversation
+
+        Yields:
+            AgentChatStreamChunk with content deltas
+        """
+        client = await self._ensure_client()
+
+        payload: dict[str, Any] = {
+            "message": message,
+            "stream": True,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+
+        async with client.stream(
+            "POST",
+            f"/v1/agents/{agent_id}/chat",
+            json=payload,
+        ) as response:
+            if not response.is_success:
+                await response.aread()
+                await self._handle_error(response)
+
+            current_session_id: Optional[str] = None
+            event_name = "message"
+            data_lines: list[str] = []
+
+            async for line in response.aiter_lines():
+                if line == "":
+                    if data_lines:
+                        data_str = "\n".join(data_lines)
+                        data_lines = []
+
+                        if data_str == "[DONE]":
+                            event_name = "message"
+                            break
+
+                        try:
+                            parsed = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            event_name = "message"
+                            continue
+
+                        if not isinstance(parsed, dict):
+                            event_name = "message"
+                            continue
+
+                        if event_name in ("ragora_metadata", "ragora_status"):
+                            rs = parsed.get("ragora_stats", {})
+                            if isinstance(rs, dict) and "conversation_id" in rs:
+                                current_session_id = rs["conversation_id"]
+                        elif event_name == "ragora_complete":
+                            rs = parsed.get("ragora_stats", {})
+                            yield AgentChatStreamChunk(
+                                content="",
+                                session_id=current_session_id,
+                                stats=rs if isinstance(rs, dict) else None,
+                                done=True,
+                            )
+                        else:
+                            choices = parsed.get("choices", [])
+                            choice = choices[0] if isinstance(choices, list) and choices else {}
+                            if not isinstance(choice, dict):
+                                choice = {}
+                            delta = choice.get("delta", {})
+                            if not isinstance(delta, dict):
+                                delta = {}
+                            content = delta.get("content", "")
+                            if content is None:
+                                content = ""
+                            if content:
+                                yield AgentChatStreamChunk(
+                                    content=str(content),
+                                    session_id=current_session_id,
+                                )
+
+                    event_name = "message"
+                    continue
+
+                if line.startswith("event:"):
+                    event_name = line[6:].strip() or "message"
+                    continue
+
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+
+            if data_lines:
+                data_str = "\n".join(data_lines)
+                if data_str != "[DONE]":
+                    try:
+                        parsed = json.loads(data_str)
+                        if isinstance(parsed, dict) and event_name == "ragora_complete":
+                            rs = parsed.get("ragora_stats", {})
+                            yield AgentChatStreamChunk(
+                                content="",
+                                session_id=current_session_id,
+                                stats=rs if isinstance(rs, dict) else None,
+                                done=True,
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
+    async def list_agent_sessions(self, agent_id: str) -> AgentSessionList:
+        """
+        List sessions for an agent.
+
+        Args:
+            agent_id: Agent ID
+
+        Returns:
+            AgentSessionList with sessions
+        """
+        data, metadata = await self._request("GET", f"/v1/agents/{agent_id}/sessions")
+
+        sessions = [
+            AgentSession(
+                id=s.get("id", ""),
+                agent_id=s.get("agent_id", ""),
+                org_id=s.get("org_id", ""),
+                source=s.get("source", ""),
+                source_key=s.get("source_key"),
+                visitor_id=s.get("visitor_id"),
+                status=s.get("status", "open"),
+                message_count=s.get("message_count", 0),
+                created_at=s.get("created_at"),
+                updated_at=s.get("updated_at"),
+            )
+            for s in data.get("sessions", [])
+        ]
+
+        return AgentSessionList(
+            sessions=sessions,
+            total=data.get("total", len(sessions)),
+            **metadata,
+        )
+
+    async def get_agent_session(
+        self,
+        agent_id: str,
+        session_id: str,
+    ) -> AgentSessionDetail:
+        """
+        Get an agent session with its messages.
+
+        Args:
+            agent_id: Agent ID
+            session_id: Session ID
+
+        Returns:
+            AgentSessionDetail with session and messages
+        """
+        data, metadata = await self._request(
+            "GET", f"/v1/agents/{agent_id}/sessions/{session_id}"
+        )
+
+        s = data.get("session", {})
+        session = AgentSession(
+            id=s.get("id", ""),
+            agent_id=s.get("agent_id", ""),
+            org_id=s.get("org_id", ""),
+            source=s.get("source", ""),
+            source_key=s.get("source_key"),
+            visitor_id=s.get("visitor_id"),
+            status=s.get("status", "open"),
+            message_count=s.get("message_count", 0),
+            created_at=s.get("created_at"),
+            updated_at=s.get("updated_at"),
+        )
+
+        messages = [
+            AgentMessage(
+                id=m.get("id", ""),
+                session_id=m.get("session_id", ""),
+                role=m.get("role", ""),
+                content=m.get("content", ""),
+                latency_ms=m.get("latency_ms"),
+                cost_usd=m.get("cost_usd"),
+                model=m.get("model"),
+                created_at=m.get("created_at"),
+            )
+            for m in data.get("messages", [])
+        ]
+
+        return AgentSessionDetail(
+            session=session,
+            messages=messages,
+            **metadata,
+        )
+
+    async def delete_agent_session(
+        self,
+        agent_id: str,
+        session_id: str,
+    ) -> DeleteResponse:
+        """
+        Delete/resolve an agent session and clean up its memory.
+
+        Args:
+            agent_id: Agent ID
+            session_id: Session ID
+
+        Returns:
+            Deletion confirmation
+        """
+        data, _ = await self._request(
+            "DELETE", f"/v1/agents/{agent_id}/sessions/{session_id}"
+        )
+        return DeleteResponse(
+            message=data.get("status", "resolved"),
+            id=session_id,
         )
