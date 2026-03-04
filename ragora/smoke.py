@@ -53,7 +53,7 @@ class FakeRagoraClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def search(self, collection_id: str, query: str, **kwargs) -> SearchResponse:
+    async def search(self, query: str, collection_id: str | None = None, **kwargs) -> SearchResponse:
         if collection_id == "non-existent-collection":
             raise RagoraException(
                 message="Collection not found",
@@ -61,7 +61,7 @@ class FakeRagoraClient:
                 error=APIError(code="not_found", message="Collection not found"),
                 request_id="smoke-404",
             )
-        if collection_id != self.collection_id:
+        if collection_id is not None and collection_id != self.collection_id:
             raise RagoraException(
                 message=f"Expected collection_id={self.collection_id}, got {collection_id}",
                 status_code=400,
@@ -87,7 +87,19 @@ class FakeRagoraClient:
             rate_limit_reset=60,
         )
 
-    async def chat(self, collection_id: str, messages: list[dict], **kwargs) -> ChatResponse:
+    def _validate_retrieval_collection(self, retrieval: dict | None) -> None:
+        if not isinstance(retrieval, dict):
+            raise RagoraException(
+                message="Expected retrieval options with collection_id for smoke run",
+                status_code=400,
+                error=APIError(code="missing_retrieval", message="Missing retrieval options"),
+                request_id="smoke-400",
+            )
+        raw_collection = retrieval.get("collection_id")
+        if isinstance(raw_collection, list):
+            collection_id = raw_collection[0] if raw_collection else None
+        else:
+            collection_id = raw_collection
         if collection_id != self.collection_id:
             raise RagoraException(
                 message=f"Expected collection_id={self.collection_id}, got {collection_id}",
@@ -95,6 +107,9 @@ class FakeRagoraClient:
                 error=APIError(code="invalid_collection_id", message="Invalid collection_id for smoke run"),
                 request_id="smoke-400",
             )
+
+    async def chat(self, messages: list[dict], *, retrieval: dict | None = None, **kwargs) -> ChatResponse:
+        self._validate_retrieval_collection(retrieval)
         _ = messages
         return ChatResponse(
             id="chat_1",
@@ -122,14 +137,8 @@ class FakeRagoraClient:
             cost_usd=0.0002,
         )
 
-    async def chat_stream(self, collection_id: str, messages: list[dict], **kwargs):
-        if collection_id != self.collection_id:
-            raise RagoraException(
-                message=f"Expected collection_id={self.collection_id}, got {collection_id}",
-                status_code=400,
-                error=APIError(code="invalid_collection_id", message="Invalid collection_id for smoke run"),
-                request_id="smoke-400",
-            )
+    async def chat_stream(self, messages: list[dict], *, retrieval: dict | None = None, **kwargs):
+        self._validate_retrieval_collection(retrieval)
         _ = messages
         yield ChatStreamChunk(content="RAG ")
         yield ChatStreamChunk(content="works ")
@@ -238,6 +247,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _run_unit_tests(root: Path) -> None:
+    if importlib.util.find_spec("pytest") is None:
+        print("Skipping unit tests: install `pytest` to enable (`pip install pytest`).")
+        return
+    tests_dir = root / "tests"
+    if not tests_dir.exists():
+        print("Skipping unit tests: no tests/ directory found.")
+        return
+    print("Running: python -m pytest tests/ -v")
+    _run([sys.executable, "-m", "pytest", "tests/", "-v"], cwd=root)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     root = Path(__file__).resolve().parent.parent
@@ -247,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_prepare:
         _run_prepare_checks(root)
 
+    _run_unit_tests(root)
     _run_examples_with_fake_client(root, examples)
     print("Smoke checks passed.")
     return 0

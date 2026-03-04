@@ -41,10 +41,12 @@ class AgenticRAGAgent:
         client: RagoraClient,
         agent_id: str,
         session_id: Optional[str] = None,
+        session_collection_ids: Optional[list[str]] = None,
     ):
         self.client = client
         self.agent_id = agent_id
         self.session_id = session_id
+        self.session_collection_ids = session_collection_ids
 
     @classmethod
     async def create(
@@ -53,6 +55,8 @@ class AgenticRAGAgent:
         name: str = "RAG Agent",
         system_prompt: Optional[str] = None,
         budget_config: Optional[dict[str, Any]] = None,
+        retrieval_policy: Optional[dict[str, Any]] = None,
+        session_collection_ids: Optional[list[str]] = None,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         agent_id: Optional[str] = None,
@@ -68,6 +72,8 @@ class AgenticRAGAgent:
             name: Agent name (used when creating)
             system_prompt: Custom system prompt
             budget_config: Budget/search config (e.g. {"top_k": 10})
+            retrieval_policy: Auto-retrieval policy constraints/defaults for tool calls
+            session_collection_ids: Optional collection scope for session-level agent chat
             api_key: Ragora API key (falls back to RAGORA_API_KEY env var)
             base_url: API base URL (falls back to RAGORA_BASE_URL env var)
             agent_id: Existing agent ID to connect to
@@ -87,7 +93,11 @@ class AgenticRAGAgent:
 
         if agent_id:
             await client.get_agent(agent_id)
-            return cls(client=client, agent_id=agent_id)
+            return cls(
+                client=client,
+                agent_id=agent_id,
+                session_collection_ids=session_collection_ids,
+            )
 
         if not collection_id:
             raise ValueError(
@@ -98,9 +108,14 @@ class AgenticRAGAgent:
             name=name,
             collection_ids=[collection_id],
             system_prompt=system_prompt,
+            retrieval_policy=retrieval_policy,
             budget_config=budget_config,
         )
-        return cls(client=client, agent_id=agent.id)
+        return cls(
+            client=client,
+            agent_id=agent.id,
+            session_collection_ids=session_collection_ids,
+        )
 
     async def chat(self, message: str) -> dict[str, Any]:
         """
@@ -112,6 +127,7 @@ class AgenticRAGAgent:
             agent_id=self.agent_id,
             message=message,
             session_id=self.session_id,
+            collection_ids=self.session_collection_ids,
         )
         if response.session_id:
             self.session_id = response.session_id
@@ -133,6 +149,7 @@ class AgenticRAGAgent:
             agent_id=self.agent_id,
             message=message,
             session_id=self.session_id,
+            collection_ids=self.session_collection_ids,
         ):
             if chunk.session_id:
                 self.session_id = chunk.session_id

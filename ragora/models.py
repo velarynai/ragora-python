@@ -24,10 +24,11 @@ class ResponseMetadata(BaseModel):
 
 class SearchResult(BaseModel):
     """A single search result."""
-    
+
     id: str = Field(..., description="Document chunk ID")
     content: str = Field(..., description="Document content")
     score: float = Field(..., description="Relevance score (0-1)")
+    source_url: Optional[str] = Field(None, description="Source URL (primary source link when available, e.g. web page URL, GitHub file URL)")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Document metadata")
     document_id: Optional[str] = Field(None, description="Parent document ID")
     collection_id: Optional[str] = Field(None, description="Collection ID")
@@ -65,26 +66,53 @@ class ChatChoice(BaseModel):
     finish_reason: Optional[str] = Field(None, description="Why generation stopped")
 
 
+class RagoraCitation(BaseModel):
+    """A structured citation from the ragora namespace."""
+    ref: int = Field(0, description="Citation reference number")
+    text: str = Field("", description="Cited text")
+    source: str = Field("", description="Source filename or URL")
+    score: float = Field(0.0, description="Relevance score")
+
+
+class RagoraExtension(BaseModel):
+    """Ragora-specific response extensions."""
+    citations: list[RagoraCitation] = Field(default_factory=list, description="Structured citations")
+    steps: list[dict[str, Any]] = Field(default_factory=list, description="Agentic reasoning steps")
+    session_id: Optional[str] = Field(None, description="Session ID for stateful agentic chat")
+
+
 class ChatResponse(ResponseMetadata):
     """Chat completion response (OpenAI-compatible)."""
-    
+
     id: str = Field(..., description="Completion ID")
     object: str = Field("chat.completion", description="Object type")
     created: int = Field(..., description="Unix timestamp")
     model: str = Field(..., description="Model used")
     choices: list[ChatChoice] = Field(default_factory=list, description="Completion choices")
     usage: Optional[dict[str, int]] = Field(None, description="Token usage")
-    
+
     # RAG-specific fields
     sources: list[SearchResult] = Field(default_factory=list, description="Source documents used (flattened from ragora_stats.sources)")
+    ragora: Optional[RagoraExtension] = None
+
+
+class ThinkingStep(BaseModel):
+    """A real-time status update emitted while the agent is working."""
+
+    type: str = Field(..., description='Step category: "thinking", "searching", "found", "generating", "working", "warning"')
+    message: str = Field(..., description="Human-readable description of what the agent is doing")
+    timestamp: int = Field(0, description="Unix-ms timestamp")
 
 
 class ChatStreamChunk(BaseModel):
     """A streaming chat chunk."""
-    
+
     content: str = Field("", description="Content delta")
     finish_reason: Optional[str] = Field(None, description="Why generation stopped")
     sources: list[SearchResult] = Field(default_factory=list, description="Sources from Ragora SSE metadata events")
+    thinking: Optional[ThinkingStep] = Field(None, description="Agent status update (thinking step)")
+    session_id: Optional[str] = Field(None, description="Conversation/session ID if provided by stream metadata")
+    stats: Optional[dict[str, Any]] = Field(None, description="Ragora stats payload from metadata/completion events")
 
 
 # --- Credit Models ---
@@ -102,6 +130,7 @@ class Collection(BaseModel):
     """A document collection."""
 
     id: str = Field(..., description="Collection ID")
+    owner_id: Optional[str] = Field(None, description="Owner user ID")
     name: str = Field(..., description="Collection name")
     slug: Optional[str] = Field(None, description="URL-friendly slug")
     description: Optional[str] = Field(None, description="Collection description")
@@ -216,12 +245,16 @@ class MarketplaceProduct(BaseModel):
     slug: str = Field(..., description="URL-friendly slug")
     title: str = Field(..., description="Product title")
     description: Optional[str] = Field(None, description="Product description")
+    thumbnail_url: Optional[str] = Field(None, description="Thumbnail image URL")
     status: str = Field("active", description="Product status: draft, active, archived")
     average_rating: float = Field(0.0, description="Average user rating")
     review_count: int = Field(0, description="Number of reviews")
     total_vectors: int = Field(0, description="Number of vectors")
     total_chunks: int = Field(0, description="Number of chunks")
     access_count: int = Field(0, description="Number of users with access")
+    data_size: Optional[str] = Field(None, description="Human-readable data size")
+    is_trending: Optional[bool] = Field(None, description="Whether the product is trending")
+    is_verified: Optional[bool] = Field(None, description="Whether the product is verified")
     seller: Optional[dict[str, Any]] = Field(None, description="Seller info")
     listings: Optional[list[dict[str, Any]]] = Field(None, description="Pricing listings")
     categories: Optional[list[dict[str, Any]]] = Field(None, description="Product categories")
@@ -241,7 +274,6 @@ class MarketplaceList(ResponseMetadata):
 
 # --- Agent Models ---
 
-
 class Agent(BaseModel):
     """An AI agent."""
 
@@ -252,6 +284,7 @@ class Agent(BaseModel):
     system_prompt: str = Field("", description="System prompt")
     collection_ids: list[str] = Field(default_factory=list, description="Linked collection IDs")
     memory_config: dict[str, Any] = Field(default_factory=dict, description="Memory configuration")
+    retrieval_policy: Optional[dict[str, Any]] = Field(None, description="Auto-retrieval policy")
     budget_config: dict[str, Any] = Field(default_factory=dict, description="Budget configuration")
     status: str = Field("active", description="Agent status")
     created_at: Optional[str] = Field(None, description="Creation timestamp")
@@ -278,7 +311,9 @@ class AgentChatStreamChunk(BaseModel):
 
     content: str = Field("", description="Content delta")
     session_id: Optional[str] = Field(None, description="Session ID")
+    sources: list[SearchResult] = Field(default_factory=list, description="Sources from Ragora metadata/completion events")
     stats: Optional[dict[str, Any]] = Field(None, description="Usage statistics")
+    thinking: Optional[ThinkingStep] = Field(None, description="Agent status update (thinking step)")
     done: bool = Field(False, description="Whether stream is complete")
 
 
@@ -378,3 +413,38 @@ class RagoraException(Exception):
     def is_retryable(self) -> bool:
         """Check if this error is worth retrying."""
         return self.status_code in (429, 500, 502, 503, 504)
+
+
+class AuthenticationError(RagoraException):
+    """Raised for 401 Unauthorized responses."""
+    pass
+
+
+class AuthorizationError(RagoraException):
+    """Raised for 403 Forbidden responses."""
+    pass
+
+
+class NotFoundError(RagoraException):
+    """Raised for 404 Not Found responses."""
+    pass
+
+
+class RateLimitError(RagoraException):
+    """Raised for 429 Too Many Requests responses."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 429,
+        error: Optional[APIError] = None,
+        request_id: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ):
+        super().__init__(message, status_code, error, request_id)
+        self.retry_after = retry_after
+
+
+class ServerError(RagoraException):
+    """Raised for 500+ server error responses."""
+    pass

@@ -6,11 +6,18 @@ Async-first HTTP client for the Ragora API.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any, AsyncIterator, Optional
+import logging
+import os
+import random
+import time
+import uuid
+from typing import Any, AsyncIterator, Optional, TypedDict
 
 import httpx
 
+from ._version import __version__
 from .models import (
     APIError,
     Agent,
@@ -21,6 +28,8 @@ from .models import (
     AgentSession,
     AgentSessionDetail,
     AgentSessionList,
+    AuthenticationError,
+    AuthorizationError,
     ChatChoice,
     ChatMessage,
     ChatResponse,
@@ -35,11 +44,69 @@ from .models import (
     Listing,
     MarketplaceList,
     MarketplaceProduct,
+    NotFoundError,
+    RagoraCitation,
     RagoraException,
+    RagoraExtension,
+    RateLimitError,
     SearchResponse,
     SearchResult,
+    ServerError,
+    ThinkingStep,
     UploadResponse,
 )
+
+logger = logging.getLogger("ragora")
+
+
+class RequestOptions(TypedDict, total=False):
+    """Per-request options that can be passed to any API method."""
+    request_id: str
+    timeout: float
+
+
+class ChatGenerationOptions(TypedDict, total=False):
+    """Chat generation options."""
+    model: str
+    temperature: float
+    max_tokens: int
+
+
+class ChatRetrievalOptions(TypedDict, total=False):
+    """Chat retrieval options."""
+    collection_id: str | list[str]
+    collection: str | list[str]
+    product_ids: list[str]
+    products: str | list[str]
+    top_k: int
+    source_type: list[str]
+    source_name: list[str]
+    version: list[str]
+    version_mode: str
+    document_keys: list[str]
+    custom_tags: list[str]
+    domain: list[str]
+    domain_filter_mode: str
+    filters: dict[str, Any]
+    enable_reranker: bool
+    graph_filter: dict[str, Any]
+    temporal_filter: dict[str, Any]
+
+
+class ChatAgenticOptions(TypedDict, total=False):
+    """Chat agentic/session options."""
+    mode: str
+    system_prompt: str
+    session: bool
+    session_id: str
+
+
+class ChatMetadataOptions(TypedDict, total=False):
+    """Chat metadata options."""
+    source: str
+    installation_id: str
+    channel_id: str
+    requester_id: str
 
 
 class RagoraClient:
@@ -53,28 +120,48 @@ class RagoraClient:
     
     DEFAULT_BASE_URL = "https://api.ragora.app"
     DEFAULT_TIMEOUT = 30.0
-    
+    DEFAULT_MAX_RETRIES = 2
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: Optional[httpx.AsyncClient] = None,
+        user_agent_suffix: Optional[str] = None,
     ):
         """
         Initialize the Ragora client.
-        
+
         Args:
-            api_key: Your Ragora API key
-            base_url: API base URL (default: https://api.ragora.app)
+            api_key: Your Ragora API key (or set RAGORA_API_KEY env var)
+            base_url: API base URL (or set RAGORA_BASE_URL env var; default: https://api.ragora.app)
             timeout: Request timeout in seconds
+            max_retries: Maximum number of retries for rate-limit (429) and server errors (5xx).
+                Set to 0 to disable automatic retries. Default: 2.
             http_client: Optional custom httpx.AsyncClient
+            user_agent_suffix: Optional suffix appended to the User-Agent header
         """
+        if api_key is None:
+            api_key = os.environ.get("RAGORA_API_KEY")
+        if api_key is None:
+            raise ValueError(
+                "api_key must be provided or set via the RAGORA_API_KEY environment variable"
+            )
         self.api_key = api_key
-        self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
+        self.base_url = (base_url or os.environ.get("RAGORA_BASE_URL") or self.DEFAULT_BASE_URL).rstrip("/")
+        self._user_agent = f"ragora-python/{__version__}"
+        if user_agent_suffix:
+            self._user_agent = f"{self._user_agent} {user_agent_suffix}"
         self.timeout = timeout
+        self.max_retries = max_retries
         self._client = http_client
         self._owns_client = http_client is None
+        self._resolver_cache_ttl_seconds = 300
+        self._collection_ref_cache: dict[str, tuple[str, float]] = {}
+        self._product_ref_cache: dict[str, tuple[str, float]] = {}
     
     async def __aenter__(self) -> "RagoraClient":
         await self._ensure_client()
@@ -92,7 +179,7 @@ class RagoraClient:
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
-                    "User-Agent": "ragora-python/0.1.0",
+                    "User-Agent": self._user_agent,
                 },
             )
         return self._client
@@ -135,29 +222,88 @@ class RagoraClient:
             "rate_limit_reset": safe_int("X-RateLimit-Reset"),
         }
     
+    @staticmethod
+    def _retry_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+        """Calculate retry delay with exponential backoff and jitter.
+
+        If the server sent a Retry-After / X-RateLimit-Reset header, use that
+        as the base delay (uncapped — the server knows best). Otherwise fall
+        back to exponential backoff capped at 30 seconds.
+        """
+        if retry_after is not None and retry_after > 0:
+            base = retry_after
+        else:
+            base = min(2 ** attempt, 30)  # 1, 2, 4, 8, 16, 30
+        # Add jitter: 0.5x–1.0x of base
+        return base * (0.5 + random.random() * 0.5)
+
+    @staticmethod
+    def _get_retry_after(response: httpx.Response) -> Optional[float]:
+        """Extract retry delay from response headers."""
+        # Prefer standard Retry-After header
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass
+        # Fall back to X-RateLimit-Reset (seconds until reset)
+        reset = response.headers.get("X-RateLimit-Reset")
+        if reset:
+            try:
+                return float(reset)
+            except ValueError:
+                pass
+        return None
+
     async def _request(
         self,
         method: str,
         path: str,
         json_data: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Make an API request and return (data, metadata)."""
         client = await self._ensure_client()
+        logger.debug("Request: %s %s", method, path)
 
-        response = await client.request(
-            method=method,
-            url=path,
-            json=json_data,
-            params=params,
-        )
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            kwargs: dict[str, Any] = {
+                "method": method,
+                "url": path,
+                "json": json_data,
+                "params": params,
+            }
+            if request_id:
+                kwargs["headers"] = {"X-Request-ID": request_id}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            response = await client.request(**kwargs)
 
-        metadata = self._extract_metadata(response)
+            metadata = self._extract_metadata(response)
+            logger.debug("Response: %s %s -> %s", method, path, response.status_code)
 
-        if not response.is_success:
+            if response.is_success:
+                return response.json(), metadata
+
+            if (
+                response.status_code in self.RETRYABLE_STATUS_CODES
+                and attempt < self.max_retries
+            ):
+                delay = self._retry_delay(
+                    attempt, self._get_retry_after(response)
+                )
+                logger.debug("Retry attempt %d after %.1fs delay", attempt + 1, delay)
+                await asyncio.sleep(delay)
+                continue
+
             await self._handle_error(response, metadata.get("request_id"))
 
-        return response.json(), metadata
+        # Should be unreachable, but satisfy the type checker
+        raise last_exc or Exception("request failed")
 
     @staticmethod
     def _parse_search_results(raw_results: Any) -> list[SearchResult]:
@@ -188,11 +334,15 @@ class RagoraClient:
             if not isinstance(metadata, dict):
                 metadata = {}
 
+            # Extract source_url: prefer top-level field, fall back to metadata
+            source_url = raw.get("source_url") or metadata.get("source_url") or None
+
             results.append(
                 SearchResult(
                     id=str(raw_id),
                     content=str(content),
                     score=score,
+                    source_url=source_url,
                     metadata=metadata,
                     document_id=raw.get("document_id"),
                     collection_id=raw.get("collection_id"),
@@ -217,70 +367,428 @@ class RagoraClient:
         file_content: bytes,
         filename: str,
         data: Optional[dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Upload a file using multipart/form-data."""
-        client = await self._ensure_client()
-
-        files = {"file": (filename, file_content)}
         form_data = data or {}
+        logger.debug("Request: POST %s (upload: %s)", path, filename)
 
-        # Create a new client without default Content-Type header for multipart
-        async with httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "User-Agent": "ragora-python/0.1.0",
-            },
-        ) as upload_client:
-            response = await upload_client.post(
-                path,
-                files=files,
-                data=form_data,
-            )
+        upload_headers: dict[str, str] = {
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": self._user_agent,
+        }
+        if request_id:
+            upload_headers["X-Request-ID"] = request_id
 
-        metadata = self._extract_metadata(response)
+        for attempt in range(self.max_retries + 1):
+            files = {"file": (filename, file_content)}
 
-        if not response.is_success:
+            # Create a new client without default Content-Type header for multipart
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=timeout if timeout is not None else self.timeout,
+                headers=upload_headers,
+            ) as upload_client:
+                response = await upload_client.post(
+                    path,
+                    files=files,
+                    data=form_data,
+                )
+
+            metadata = self._extract_metadata(response)
+            logger.debug("Response: POST %s (upload) -> %s", path, response.status_code)
+
+            if response.is_success:
+                return response.json(), metadata
+
+            if (
+                response.status_code in self.RETRYABLE_STATUS_CODES
+                and attempt < self.max_retries
+            ):
+                delay = self._retry_delay(
+                    attempt, self._get_retry_after(response)
+                )
+                logger.debug("Retry attempt %d after %.1fs delay", attempt + 1, delay)
+                await asyncio.sleep(delay)
+                continue
+
             await self._handle_error(response, metadata.get("request_id"))
 
-        return response.json(), metadata
+        raise Exception("upload failed")
     
+    @staticmethod
+    def _build_error(
+        message: str,
+        status_code: int,
+        error: Optional[APIError] = None,
+        request_id: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> RagoraException:
+        """Map HTTP status code to the appropriate error subclass."""
+        if status_code == 401:
+            return AuthenticationError(message, status_code, error, request_id)
+        if status_code == 403:
+            return AuthorizationError(message, status_code, error, request_id)
+        if status_code == 404:
+            return NotFoundError(message, status_code, error, request_id)
+        if status_code == 429:
+            return RateLimitError(message, status_code, error, request_id, retry_after)
+        if status_code >= 500:
+            return ServerError(message, status_code, error, request_id)
+        return RagoraException(message, status_code, error, request_id)
+
     async def _handle_error(
         self,
         response: httpx.Response,
         request_id: Optional[str] = None,
     ) -> None:
         """Handle error responses."""
+        retry_after = self._get_retry_after(response)
         try:
             data = response.json()
             if "error" in data:
                 error_data = data["error"]
                 if isinstance(error_data, dict):
                     error = APIError(**error_data)
-                    raise RagoraException(
+                    raise self._build_error(
                         message=error.message,
                         status_code=response.status_code,
                         error=error,
                         request_id=request_id,
+                        retry_after=retry_after,
                     )
                 else:
-                    raise RagoraException(
+                    raise self._build_error(
                         message=str(error_data),
                         status_code=response.status_code,
                         request_id=request_id,
+                        retry_after=retry_after,
                     )
-            raise RagoraException(
+            raise self._build_error(
                 message=data.get("message", response.text),
                 status_code=response.status_code,
                 request_id=request_id,
+                retry_after=retry_after,
             )
         except json.JSONDecodeError:
-            raise RagoraException(
+            raise self._build_error(
                 message=response.text or f"HTTP {response.status_code}",
                 status_code=response.status_code,
                 request_id=request_id,
+                retry_after=retry_after,
             )
+
+    def _normalize_identifier_key(self, value: str) -> str:
+        return value.strip().lower()
+
+    def _cache_get(self, cache: dict[str, tuple[str, float]], key: str) -> Optional[str]:
+        now = time.time()
+        cached = cache.get(key)
+        if cached is None:
+            return None
+        resolved, expires_at = cached
+        if expires_at <= now:
+            cache.pop(key, None)
+            return None
+        return resolved
+
+    def _cache_set(self, cache: dict[str, tuple[str, float]], key: str, resolved_id: str) -> None:
+        cache[key] = (resolved_id, time.time() + self._resolver_cache_ttl_seconds)
+
+    @staticmethod
+    def _preview_id(raw_id: str) -> str:
+        if len(raw_id) <= 10:
+            return raw_id
+        return f"{raw_id[:8]}..."
+
+    def _raise_ambiguous_identifier(self, kind: str, identifier: str, candidates: list[str]) -> None:
+        message = (
+            f"Ambiguous {kind} '{identifier}'. "
+            f"Matches: {', '.join(candidates[:5])}. "
+            "Use slug or UUID for an exact match."
+        )
+        raise RagoraException(
+            message=message,
+            status_code=400,
+            error=APIError(code="AMBIGUOUS_IDENTIFIER", message=message),
+        )
+
+    def _raise_identifier_not_found(self, kind: str, identifier: str) -> None:
+        message = (
+            f"{kind.capitalize()} '{identifier}' was not found in your accessible scope. "
+            "Use list endpoints or pass slug/UUID."
+        )
+        raise RagoraException(
+            message=message,
+            status_code=404,
+            error=APIError(code="IDENTIFIER_NOT_FOUND", message=message),
+        )
+
+    async def _list_accessible_collections_raw(self) -> list[dict[str, Any]]:
+        limit = 100
+        offset = 0
+        all_items: list[dict[str, Any]] = []
+
+        for _ in range(50):
+            params = {"limit": limit, "offset": offset}
+            data, _ = await self._request("GET", "/v1/collections", params=params)
+
+            page = data.get("data", [])
+            if isinstance(page, list):
+                all_items.extend(item for item in page if isinstance(item, dict))
+
+            has_more = bool(data.get("hasMore", data.get("has_more", False)))
+            if not has_more:
+                break
+            offset += limit
+
+        return all_items
+
+    async def _list_accessible_products_raw(self) -> list[dict[str, Any]]:
+        data, _ = await self._request("GET", "/v1/products/accessible")
+        items = data.get("data", [])
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    async def resolve_collection(self, collection: str) -> str:
+        """
+        Resolve a collection reference (UUID, slug, or name) to a collection UUID.
+        """
+        ref = collection.strip()
+        if ref == "":
+            raise ValueError("collection cannot be empty")
+
+        cache_key = self._normalize_identifier_key(ref)
+        cached = self._cache_get(self._collection_ref_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            parsed = uuid.UUID(ref)
+            resolved = str(parsed)
+            self._cache_set(self._collection_ref_cache, cache_key, resolved)
+            return resolved
+        except ValueError:
+            pass
+
+        collections = await self._list_accessible_collections_raw()
+        ref_lower = ref.lower()
+
+        id_matches = [c for c in collections if str(c.get("id", "")) == ref]
+        if len(id_matches) == 1:
+            resolved = str(id_matches[0]["id"])
+            self._cache_set(self._collection_ref_cache, cache_key, resolved)
+            return resolved
+
+        slug_matches = [
+            c for c in collections
+            if isinstance(c.get("slug"), str) and c["slug"].lower() == ref_lower
+        ]
+        if len(slug_matches) == 1:
+            resolved = str(slug_matches[0]["id"])
+            self._cache_set(self._collection_ref_cache, cache_key, resolved)
+            return resolved
+
+        name_matches = [
+            c for c in collections
+            if isinstance(c.get("name"), str) and c["name"].lower() == ref_lower
+        ]
+        if len(name_matches) > 1:
+            candidates = [
+                f"{m.get('name', '')} (slug={m.get('slug', '-')}, id={self._preview_id(str(m.get('id', '')))})"
+                for m in name_matches
+            ]
+            self._raise_ambiguous_identifier("collection", ref, candidates)
+        if len(name_matches) == 1:
+            resolved = str(name_matches[0]["id"])
+            self._cache_set(self._collection_ref_cache, cache_key, resolved)
+            return resolved
+
+        # Convenience fallback: allow product slug/title as collection reference.
+        products = await self._list_accessible_products_raw()
+        product_slug_matches = [
+            p for p in products
+            if isinstance(p.get("slug"), str) and p["slug"].lower() == ref_lower
+        ]
+        product_title_matches = [
+            p for p in products
+            if isinstance(p.get("title"), str) and p["title"].lower() == ref_lower
+        ]
+        product_collection_slug_matches = [
+            p for p in products
+            if isinstance(p.get("collection_slug"), str) and p["collection_slug"].lower() == ref_lower
+        ]
+        product_collection_name_matches = [
+            p for p in products
+            if isinstance(p.get("collection_name"), str) and p["collection_name"].lower() == ref_lower
+        ]
+        product_matches = (
+            product_slug_matches
+            or product_title_matches
+            or product_collection_slug_matches
+            or product_collection_name_matches
+        )
+        product_matches = [
+            p for p in product_matches
+            if isinstance(p.get("collection_id"), str) and p["collection_id"].strip() != ""
+        ]
+        if len(product_matches) > 1:
+            candidates = [
+                f"{m.get('title', '')} (slug={m.get('slug', '-')}, id={self._preview_id(str(m.get('id', '')))})"
+                for m in product_matches
+            ]
+            self._raise_ambiguous_identifier("collection", ref, candidates)
+        if len(product_matches) == 1:
+            resolved = str(product_matches[0]["collection_id"])
+            self._cache_set(self._collection_ref_cache, cache_key, resolved)
+            return resolved
+
+        self._raise_identifier_not_found("collection", ref)
+        return ""
+
+    async def resolve_product(self, product: str) -> str:
+        """
+        Resolve a product reference (UUID, slug, or title) to a product UUID.
+        """
+        ref = product.strip()
+        if ref == "":
+            raise ValueError("product cannot be empty")
+
+        cache_key = self._normalize_identifier_key(ref)
+        cached = self._cache_get(self._product_ref_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            parsed = uuid.UUID(ref)
+            resolved = str(parsed)
+            self._cache_set(self._product_ref_cache, cache_key, resolved)
+            return resolved
+        except ValueError:
+            pass
+
+        products = await self._list_accessible_products_raw()
+        ref_lower = ref.lower()
+
+        id_matches = [p for p in products if str(p.get("id", "")) == ref]
+        if len(id_matches) == 1:
+            resolved = str(id_matches[0]["id"])
+            self._cache_set(self._product_ref_cache, cache_key, resolved)
+            return resolved
+
+        slug_matches = [
+            p for p in products
+            if isinstance(p.get("slug"), str) and p["slug"].lower() == ref_lower
+        ]
+        if len(slug_matches) == 1:
+            resolved = str(slug_matches[0]["id"])
+            self._cache_set(self._product_ref_cache, cache_key, resolved)
+            return resolved
+
+        title_matches = [
+            p for p in products
+            if isinstance(p.get("title"), str) and p["title"].lower() == ref_lower
+        ]
+        if len(title_matches) > 1:
+            candidates = [
+                f"{m.get('title', '')} (slug={m.get('slug', '-')}, id={self._preview_id(str(m.get('id', '')))})"
+                for m in title_matches
+            ]
+            self._raise_ambiguous_identifier("product", ref, candidates)
+        if len(title_matches) == 1:
+            resolved = str(title_matches[0]["id"])
+            self._cache_set(self._product_ref_cache, cache_key, resolved)
+            return resolved
+
+        self._raise_identifier_not_found("product", ref)
+        return ""
+
+    def _raise_conflicting_reference_inputs(self, preferred: str, legacy: str) -> None:
+        raise ValueError(f"Pass either '{preferred}' or '{legacy}', not both.")
+
+    def _normalize_reference_list(self, refs: str | list[str], label: str) -> list[str]:
+        raw_values = [refs] if isinstance(refs, str) else refs
+        normalized: list[str] = []
+        for value in raw_values:
+            if not isinstance(value, str):
+                raise TypeError(f"{label} values must be strings.")
+            cleaned = value.strip()
+            if cleaned == "":
+                raise ValueError(f"{label} cannot contain empty values.")
+            normalized.append(cleaned)
+        if not normalized:
+            raise ValueError(f"{label} cannot be empty.")
+        return normalized
+
+    def _dedupe_preserve_order(self, values: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = self._normalize_identifier_key(value)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(value)
+        return deduped
+
+    async def _resolve_collection_ids(
+        self,
+        *,
+        collection: Optional[str | list[str]],
+        collection_id: Optional[str | list[str]],
+    ) -> Optional[list[str]]:
+        if collection is not None and collection_id is not None:
+            self._raise_conflicting_reference_inputs("collection", "collection_id")
+
+        if collection is None:
+            if collection_id is None:
+                return None
+            return self._normalize_reference_list(collection_id, "collection_id")
+
+        refs = self._normalize_reference_list(collection, "collection")
+        resolved_ids: list[str] = []
+        for ref in refs:
+            resolved_ids.append(await self.resolve_collection(ref))
+        return self._dedupe_preserve_order(resolved_ids)
+
+    async def _resolve_single_collection_id(
+        self,
+        *,
+        collection: Optional[str],
+        collection_id: Optional[str | list[str]],
+    ) -> Optional[str]:
+        resolved_ids = await self._resolve_collection_ids(
+            collection=collection,
+            collection_id=collection_id,
+        )
+        if resolved_ids is None:
+            return None
+        if len(resolved_ids) != 1:
+            raise ValueError("Exactly one collection must be provided for this operation.")
+        return resolved_ids[0]
+
+    async def _resolve_product_ids(
+        self,
+        *,
+        products: Optional[str | list[str]],
+        product_ids: Optional[list[str]],
+    ) -> Optional[list[str]]:
+        if products is not None and product_ids is not None:
+            self._raise_conflicting_reference_inputs("products", "product_ids")
+
+        if products is None:
+            if product_ids is None:
+                return None
+            normalized_ids = self._normalize_reference_list(product_ids, "product_ids")
+            return self._dedupe_preserve_order(normalized_ids)
+
+        refs = self._normalize_reference_list(products, "products")
+        resolved_ids: list[str] = []
+        for ref in refs:
+            resolved_ids.append(await self.resolve_product(ref))
+        return self._dedupe_preserve_order(resolved_ids)
     
     # --- Search ---
     
@@ -288,8 +796,8 @@ class RagoraClient:
         self,
         query: str,
         collection_id: Optional[str] = None,
+        collection: Optional[str | list[str]] = None,
         top_k: int = 5,
-        threshold: Optional[float] = None,
         filters: Optional[dict[str, Any]] = None,
         source_type: Optional[list[str]] = None,
         source_name: Optional[list[str]] = None,
@@ -302,15 +810,16 @@ class RagoraClient:
         enable_reranker: Optional[bool] = None,
         graph_filter: Optional[dict[str, Any]] = None,
         temporal_filter: Optional[dict[str, Any]] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> SearchResponse:
         """
         Search for relevant documents.
 
         Args:
             query: Search query
-            collection_id: Collection ID or slug (omit to search all accessible collections)
+            collection_id: Collection ID or slug (legacy parameter)
+            collection: Collection UUID/slug/name (or list); can also be a product slug/title
             top_k: Number of results to return (default: 5)
-            threshold: Minimum relevance score (0-1)
             filters: Metadata filters (MongoDB-style operators)
             source_type: Filter by source type (e.g., ["upload", "html", "youtube"])
             source_name: Filter by source name
@@ -323,18 +832,23 @@ class RagoraClient:
             enable_reranker: Toggle reranker for result refinement (default: false)
             graph_filter: Knowledge graph filter (e.g., {"entities": ["john"], "entity_type": "PERSON"})
             temporal_filter: Temporal filter (e.g., {"since": "2024-01-01T00:00:00Z", "recency_weight": 0.5})
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             SearchResponse with results and metadata
         """
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         payload: dict[str, Any] = {
             "query": query,
             "top_k": top_k,
         }
-        if collection_id is not None:
-            payload["collection_ids"] = [collection_id]
-        if threshold is not None:
-            payload["threshold"] = threshold
+        collection_ids = await self._resolve_collection_ids(
+            collection=collection,
+            collection_id=collection_id,
+        )
+        if collection_ids is not None:
+            payload["collection_ids"] = collection_ids
         if filters is not None:
             payload["filters"] = filters
         if source_type is not None:
@@ -360,8 +874,11 @@ class RagoraClient:
         if temporal_filter is not None:
             payload["temporal_filter"] = temporal_filter
         
-        data, metadata = await self._request("POST", "/v1/retrieve", json_data=payload)
-        
+        data, metadata = await self._request(
+            "POST", "/v1/retrieve", json_data=payload,
+            request_id=_rid, timeout=_tout,
+        )
+
         results = self._parse_search_results(data.get("results", []))
 
         fragments = data.get("fragments")
@@ -395,77 +912,133 @@ class RagoraClient:
         )
     
     # --- Chat ---
-    
+
+    async def _build_chat_payload(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        generation: Optional[ChatGenerationOptions],
+        retrieval: Optional[ChatRetrievalOptions],
+        agentic: Optional[ChatAgenticOptions],
+        metadata: Optional[ChatMetadataOptions],
+        stream: bool,
+    ) -> dict[str, Any]:
+        generation_options = generation or {}
+        retrieval_options = retrieval or {}
+        agentic_options = agentic or {}
+
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "stream": stream,
+            "temperature": generation_options.get("temperature", 0.7),
+        }
+
+        model = generation_options.get("model")
+        if model is not None:
+            payload["model"] = model
+        max_tokens = generation_options.get("max_tokens")
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        collection_ids = await self._resolve_collection_ids(
+            collection=retrieval_options.get("collection"),
+            collection_id=retrieval_options.get("collection_id"),
+        )
+        if collection_ids is not None:
+            payload["collection_ids"] = collection_ids
+
+        resolved_product_ids = await self._resolve_product_ids(
+            products=retrieval_options.get("products"),
+            product_ids=retrieval_options.get("product_ids"),
+        )
+        if resolved_product_ids is not None:
+            payload["product_ids"] = resolved_product_ids
+
+        for field in (
+            "top_k",
+            "source_type",
+            "source_name",
+            "version",
+            "version_mode",
+            "document_keys",
+            "custom_tags",
+            "domain",
+            "domain_filter_mode",
+            "filters",
+            "enable_reranker",
+            "graph_filter",
+            "temporal_filter",
+        ):
+            value = retrieval_options.get(field)
+            if value is not None:
+                payload[field] = value
+
+        if metadata is not None:
+            payload["metadata"] = metadata
+
+        if "mode" in agentic_options and agentic_options.get("mode") is not None:
+            payload["mode"] = agentic_options["mode"]
+        if "system_prompt" in agentic_options and agentic_options.get("system_prompt") is not None:
+            payload["system_prompt"] = agentic_options["system_prompt"]
+        if "session" in agentic_options and agentic_options.get("session") is not None:
+            payload["session"] = bool(agentic_options["session"])
+        if "session_id" in agentic_options and agentic_options.get("session_id") is not None:
+            payload["session_id"] = agentic_options["session_id"]
+
+        return payload
+
+    @staticmethod
+    def _extract_stream_session_id(payload: dict[str, Any]) -> Optional[str]:
+        ragora_stats = payload.get("ragora_stats")
+        if isinstance(ragora_stats, dict):
+            conversation_id = ragora_stats.get("conversation_id")
+            if isinstance(conversation_id, str) and conversation_id.strip():
+                return conversation_id
+
+        ragora = payload.get("ragora")
+        if isinstance(ragora, dict):
+            session_id = ragora.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                return session_id
+
+        return None
+
     async def chat(
         self,
         messages: list[dict[str, str]],
-        collection_id: Optional[str] = None,
-        product_ids: Optional[list[str]] = None,
-        model: str = "google/gemini-2.5-flash",
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        top_k: Optional[int] = None,
-        source_type: Optional[list[str]] = None,
-        source_name: Optional[list[str]] = None,
-        version: Optional[list[str]] = None,
-        custom_tags: Optional[list[str]] = None,
-        filters: Optional[dict[str, Any]] = None,
-        enable_reranker: Optional[bool] = None,
-        metadata: Optional[dict[str, str]] = None,
+        generation: Optional[ChatGenerationOptions] = None,
+        retrieval: Optional[ChatRetrievalOptions] = None,
+        agentic: Optional[ChatAgenticOptions] = None,
+        metadata: Optional[ChatMetadataOptions] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> ChatResponse:
         """
         Generate a chat completion with RAG context.
 
         Args:
             messages: Chat messages (role/content dicts)
-            collection_id: Collection ID or slug (omit to use all accessible collections)
-            product_ids: Product IDs to search
-            model: Model to use via OpenRouter (e.g., "openai/google/gemini-2.5-flash", "anthropic/claude-4-5-sonnet")
-            temperature: Sampling temperature (0-2)
-            max_tokens: Maximum tokens to generate
-            top_k: Number of chunks to retrieve for context (default: 5, max: 20)
-            source_type: Filter by source type
-            source_name: Filter by source name
-            version: Filter by document version
-            custom_tags: Filter by custom tags
-            filters: Metadata filters (MongoDB-style operators)
-            enable_reranker: Toggle reranker (default: false)
-            metadata: Request metadata for analytics (source, installation_id, channel_id, requester_id)
-
-        Returns:
-            ChatResponse with completion and sources
+            generation: Generation options (model/temperature/max_tokens)
+            retrieval: Retrieval options (scope, filters, top_k)
+            agentic: Agentic/session options (mode/system_prompt/session/session_id)
+            metadata: Request metadata for analytics
+            request_options: Per-request options (request_id, timeout)
         """
-        payload: dict[str, Any] = {
-            "messages": messages,
-            "model": model,
-            "temperature": temperature,
-            "stream": False,
-        }
-        if collection_id is not None:
-            payload["collection_ids"] = [collection_id]
-        if product_ids is not None:
-            payload["product_ids"] = product_ids
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if top_k is not None:
-            payload["top_k"] = top_k
-        if source_type is not None:
-            payload["source_type"] = source_type
-        if source_name is not None:
-            payload["source_name"] = source_name
-        if version is not None:
-            payload["version"] = version
-        if custom_tags is not None:
-            payload["custom_tags"] = custom_tags
-        if filters is not None:
-            payload["filters"] = filters
-        if enable_reranker is not None:
-            payload["enable_reranker"] = enable_reranker
-        if metadata is not None:
-            payload["metadata"] = metadata
-        
-        data, metadata = await self._request("POST", "/v1/chat/completions", json_data=payload)
-        
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        payload = await self._build_chat_payload(
+            messages=messages,
+            generation=generation,
+            retrieval=retrieval,
+            agentic=agentic,
+            metadata=metadata,
+            stream=False,
+        )
+
+        data, response_metadata = await self._request(
+            "POST", "/v1/chat/completions", json_data=payload,
+            request_id=_rid, timeout=_tout,
+        )
+
         choices = [
             ChatChoice(
                 index=c.get("index", 0),
@@ -476,108 +1049,111 @@ class RagoraClient:
                 finish_reason=c.get("finish_reason"),
             )
             for c in data.get("choices", [])
+            if isinstance(c, dict)
         ]
-        
         sources = self._extract_chat_sources(data)
+
+        ragora_data = data.get("ragora")
+        ragora_ext = None
+        if isinstance(ragora_data, dict):
+            citations: list[RagoraCitation] = []
+            for c in ragora_data.get("citations", []):
+                if not isinstance(c, dict):
+                    continue
+                ref_raw = c.get("ref", 0)
+                try:
+                    ref = int(ref_raw)
+                except (TypeError, ValueError):
+                    ref = 0
+                score_raw = c.get("score", 0.0)
+                try:
+                    score = float(score_raw)
+                except (TypeError, ValueError):
+                    score = 0.0
+                citations.append(
+                    RagoraCitation(
+                        ref=ref,
+                        text=str(c.get("text", "")),
+                        source=str(c.get("source", "")),
+                        score=score,
+                    )
+                )
+            steps = ragora_data.get("steps", [])
+            ragora_ext = RagoraExtension(
+                citations=citations,
+                steps=steps if isinstance(steps, list) else [],
+                session_id=ragora_data.get("session_id") if isinstance(ragora_data.get("session_id"), str) else None,
+            )
 
         return ChatResponse(
             id=data.get("id", ""),
             object=data.get("object", "chat.completion"),
             created=data.get("created", 0),
-            model=data.get("model", model),
+            model=data.get("model", payload.get("model")),
             choices=choices,
             usage=data.get("usage"),
             sources=sources,
-            **metadata,
+            ragora=ragora_ext,
+            **response_metadata,
         )
-    
+
     async def chat_stream(
         self,
         messages: list[dict[str, str]],
-        collection_id: Optional[str] = None,
-        product_ids: Optional[list[str]] = None,
-        model: str = "google/gemini-2.5-flash",
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        top_k: Optional[int] = None,
-        source_type: Optional[list[str]] = None,
-        source_name: Optional[list[str]] = None,
-        version: Optional[list[str]] = None,
-        custom_tags: Optional[list[str]] = None,
-        filters: Optional[dict[str, Any]] = None,
-        enable_reranker: Optional[bool] = None,
-        metadata: Optional[dict[str, str]] = None,
+        generation: Optional[ChatGenerationOptions] = None,
+        retrieval: Optional[ChatRetrievalOptions] = None,
+        agentic: Optional[ChatAgenticOptions] = None,
+        metadata: Optional[ChatMetadataOptions] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> AsyncIterator[ChatStreamChunk]:
         """
         Stream a chat completion with RAG context.
 
         Args:
             messages: Chat messages (role/content dicts)
-            collection_id: Collection ID or slug (omit to use all accessible collections)
-            product_ids: Product IDs to search
-            model: Model to use via OpenRouter (e.g., "openai/google/gemini-2.5-flash", "anthropic/claude-4-5-sonnet")
-            temperature: Sampling temperature (0-2)
-            max_tokens: Maximum tokens to generate
-            top_k: Number of chunks to retrieve for context (default: 5, max: 20)
-            source_type: Filter by source type
-            source_name: Filter by source name
-            version: Filter by document version
-            custom_tags: Filter by custom tags
-            filters: Metadata filters (MongoDB-style operators)
-            enable_reranker: Toggle reranker (default: false)
-            metadata: Request metadata for analytics (source, installation_id, channel_id, requester_id)
-
-        Yields:
-            ChatStreamChunk with content deltas
+            generation: Generation options (model/temperature/max_tokens)
+            retrieval: Retrieval options (scope, filters, top_k)
+            agentic: Agentic/session options (mode/system_prompt/session/session_id)
+            metadata: Request metadata for analytics
+            request_options: Per-request options (request_id, timeout)
         """
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         client = await self._ensure_client()
+        payload = await self._build_chat_payload(
+            messages=messages,
+            generation=generation,
+            retrieval=retrieval,
+            agentic=agentic,
+            metadata=metadata,
+            stream=True,
+        )
 
-        payload: dict[str, Any] = {
-            "messages": messages,
-            "model": model,
-            "temperature": temperature,
-            "stream": True,
+        _stream_kwargs: dict[str, Any] = {
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "json": payload,
         }
-        if collection_id is not None:
-            payload["collection_ids"] = [collection_id]
-        if product_ids is not None:
-            payload["product_ids"] = product_ids
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if top_k is not None:
-            payload["top_k"] = top_k
-        if source_type is not None:
-            payload["source_type"] = source_type
-        if source_name is not None:
-            payload["source_name"] = source_name
-        if version is not None:
-            payload["version"] = version
-        if custom_tags is not None:
-            payload["custom_tags"] = custom_tags
-        if filters is not None:
-            payload["filters"] = filters
-        if enable_reranker is not None:
-            payload["enable_reranker"] = enable_reranker
-        if metadata is not None:
-            payload["metadata"] = metadata
-        
-        async with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json=payload,
-        ) as response:
+        if _rid:
+            _stream_kwargs["headers"] = {"X-Request-ID": _rid}
+        if _tout is not None:
+            _stream_kwargs["timeout"] = _tout
+
+        async with client.stream(**_stream_kwargs) as response:
             if not response.is_success:
-                # Read the full response for error handling
                 await response.aread()
                 await self._handle_error(response)
 
             event_name = "message"
             data_lines: list[str] = []
+            current_session_id: Optional[str] = None
 
             def parse_sse_event(
                 current_event: str,
                 current_data_lines: list[str],
             ) -> tuple[Optional[ChatStreamChunk], bool]:
+                nonlocal current_session_id
+
                 if not current_data_lines:
                     return None, False
 
@@ -586,20 +1162,52 @@ class RagoraClient:
                     return None, True
 
                 try:
-                    payload = json.loads(data_str)
+                    event_payload = json.loads(data_str)
                 except json.JSONDecodeError:
                     return None, False
 
-                if not isinstance(payload, dict):
+                if not isinstance(event_payload, dict):
                     return None, False
 
-                if current_event in {"ragora_metadata", "ragora_complete"}:
-                    sources = self._extract_chat_sources(payload)
-                    if not sources:
-                        return None, False
-                    return ChatStreamChunk(content="", finish_reason=None, sources=sources), False
+                extracted_session_id = self._extract_stream_session_id(event_payload)
+                if extracted_session_id is not None:
+                    current_session_id = extracted_session_id
 
-                choices = payload.get("choices", [])
+                ragora_stats = event_payload.get("ragora_stats")
+                parsed_stats = ragora_stats if isinstance(ragora_stats, dict) else None
+
+                if current_event in {"ragora_status", "ragora.step"}:
+                    thinking = None
+                    step_type = event_payload.get("type")
+                    step_message = event_payload.get("message")
+                    if isinstance(step_type, str) and isinstance(step_message, str):
+                        thinking = ThinkingStep(
+                            type=step_type,
+                            message=step_message,
+                            timestamp=event_payload.get("timestamp", 0),
+                        )
+                    return ChatStreamChunk(
+                        content="",
+                        finish_reason=None,
+                        sources=[],
+                        thinking=thinking,
+                        session_id=current_session_id,
+                        stats=parsed_stats,
+                    ), False
+
+                if current_event in {"ragora_metadata", "ragora_complete"}:
+                    sources = self._extract_chat_sources(event_payload)
+                    if not sources and current_session_id is None and current_event != "ragora_complete":
+                        return None, False
+                    return ChatStreamChunk(
+                        content="",
+                        finish_reason=None,
+                        sources=sources,
+                        session_id=current_session_id,
+                        stats=parsed_stats,
+                    ), False
+
+                choices = event_payload.get("choices", [])
                 choice = choices[0] if isinstance(choices, list) and choices else {}
                 if not isinstance(choice, dict):
                     choice = {}
@@ -616,18 +1224,17 @@ class RagoraClient:
                 if finish_reason is not None and not isinstance(finish_reason, str):
                     finish_reason = str(finish_reason)
 
-                sources = self._extract_chat_sources(payload)
+                sources = self._extract_chat_sources(event_payload)
                 if not content and finish_reason is None and not sources:
                     return None, False
 
-                return (
-                    ChatStreamChunk(
-                        content=str(content),
-                        finish_reason=finish_reason,
-                        sources=sources,
-                    ),
-                    False,
-                )
+                return ChatStreamChunk(
+                    content=str(content),
+                    finish_reason=finish_reason,
+                    sources=sources,
+                    session_id=current_session_id,
+                    stats=parsed_stats,
+                ), False
 
             async for line in response.aiter_lines():
                 if line == "":
@@ -654,14 +1261,25 @@ class RagoraClient:
     
     # --- Credits ---
     
-    async def get_balance(self) -> CreditBalance:
+    async def get_balance(
+        self,
+        request_options: Optional[RequestOptions] = None,
+    ) -> CreditBalance:
         """
         Get current credit balance.
-        
+
+        Args:
+            request_options: Per-request options (request_id, timeout)
+
         Returns:
             CreditBalance with current balance
         """
-        data, metadata = await self._request("GET", "/v1/credits/balance")
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, metadata = await self._request(
+            "GET", "/v1/credits/balance",
+            request_id=_rid, timeout=_tout,
+        )
         
         return CreditBalance(
             balance_usd=data.get("balance_usd", 0.0),
@@ -676,23 +1294,30 @@ class RagoraClient:
         limit: int = 20,
         offset: int = 0,
         search: Optional[str] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> CollectionList:
         """
         List your collections.
-        
+
         Args:
             limit: Number of results per page (max 100)
             offset: Pagination offset
             search: Optional search query
-            
+            request_options: Per-request options (request_id, timeout)
+
         Returns:
             CollectionList with collections and pagination info
         """
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if search:
             params["search"] = search
-        
-        data, metadata = await self._request("GET", "/v1/collections", params=params)
+
+        data, metadata = await self._request(
+            "GET", "/v1/collections", params=params,
+            request_id=_rid, timeout=_tout,
+        )
         
         collections = [
             Collection(
@@ -719,17 +1344,27 @@ class RagoraClient:
             **metadata,
         )
     
-    async def get_collection(self, collection_id: str) -> Collection:
+    async def get_collection(
+        self,
+        collection_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> Collection:
         """
         Get a specific collection by ID or slug.
 
         Args:
             collection_id: Collection ID or slug
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             Collection details
         """
-        data, _ = await self._request("GET", f"/v1/collections/{collection_id}")
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "GET", f"/v1/collections/{collection_id}",
+            request_id=_rid, timeout=_tout,
+        )
 
         # Handle nested data structure
         coll_data = data.get("data", data)
@@ -752,6 +1387,7 @@ class RagoraClient:
         name: str,
         description: Optional[str] = None,
         slug: Optional[str] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> Collection:
         """
         Create a new collection.
@@ -760,17 +1396,23 @@ class RagoraClient:
             name: Collection name
             description: Optional description
             slug: Optional URL-friendly slug (auto-generated if not provided)
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             Created collection
         """
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         payload: dict[str, Any] = {"name": name}
         if description is not None:
             payload["description"] = description
         if slug is not None:
             payload["slug"] = slug
 
-        data, _ = await self._request("POST", "/v1/collections", json_data=payload)
+        data, _ = await self._request(
+            "POST", "/v1/collections", json_data=payload,
+            request_id=_rid, timeout=_tout,
+        )
 
         # Handle nested data structure
         coll_data = data.get("data", data)
@@ -795,6 +1437,7 @@ class RagoraClient:
         description: Optional[str] = None,
         slug: Optional[str] = None,
         capability_config: Optional[dict[str, Any]] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> Collection:
         """
         Update an existing collection.
@@ -805,10 +1448,13 @@ class RagoraClient:
             description: New description (optional)
             slug: New slug (optional)
             capability_config: MCP tool configuration (optional)
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             Updated collection
         """
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         payload: dict[str, Any] = {}
         if name is not None:
             payload["name"] = name
@@ -820,7 +1466,8 @@ class RagoraClient:
             payload["capability_config"] = capability_config
 
         data, _ = await self._request(
-            "PATCH", f"/v1/collections/{collection_id}", json_data=payload
+            "PATCH", f"/v1/collections/{collection_id}", json_data=payload,
+            request_id=_rid, timeout=_tout,
         )
 
         # Handle nested data structure
@@ -839,17 +1486,27 @@ class RagoraClient:
             updated_at=coll_data.get("updated_at"),
         )
 
-    async def delete_collection(self, collection_id: str) -> DeleteResponse:
+    async def delete_collection(
+        self,
+        collection_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> DeleteResponse:
         """
         Delete a collection and all its documents.
 
         Args:
             collection_id: Collection ID or slug
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             Deletion confirmation
         """
-        data, _ = await self._request("DELETE", f"/v1/collections/{collection_id}")
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "DELETE", f"/v1/collections/{collection_id}",
+            request_id=_rid, timeout=_tout,
+        )
 
         return DeleteResponse(
             message=data.get("message", "Collection deleted"),
@@ -864,6 +1521,7 @@ class RagoraClient:
         file_content: bytes,
         filename: str,
         collection_id: Optional[str] = None,
+        collection: Optional[str] = None,
         relative_path: Optional[str] = None,
         release_tag: Optional[str] = None,
         version: Optional[str] = None,
@@ -875,6 +1533,7 @@ class RagoraClient:
         custom_tags: Optional[list[str]] = None,
         domain: Optional[str] = None,
         scan_mode: Optional[str] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> UploadResponse:
         """
         Upload a document to a collection.
@@ -882,7 +1541,8 @@ class RagoraClient:
         Args:
             file_content: File content as bytes
             filename: Original filename
-            collection_id: Target collection ID or slug (uses default if not provided)
+            collection_id: Target collection ID or slug (legacy parameter)
+            collection: Target collection UUID/slug/name or product slug/title
             relative_path: Relative path for directory-style uploads
             release_tag: Release tag for versioned documents
             version: Document version string
@@ -900,9 +1560,14 @@ class RagoraClient:
         """
         import json
 
+        resolved_collection_id = await self._resolve_single_collection_id(
+            collection=collection,
+            collection_id=collection_id,
+        )
+
         form_data: dict[str, Any] = {}
-        if collection_id is not None:
-            form_data["collection_id"] = collection_id
+        if resolved_collection_id is not None:
+            form_data["collection_id"] = resolved_collection_id
         if relative_path is not None:
             form_data["relative_path"] = relative_path
         if release_tag is not None:
@@ -926,18 +1591,22 @@ class RagoraClient:
         if scan_mode is not None:
             form_data["scan_mode"] = scan_mode
 
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         data, metadata = await self._upload_file(
             "/v1/documents",
             file_content=file_content,
             filename=filename,
             data=form_data,
+            request_id=_rid,
+            timeout=_tout,
         )
 
         return UploadResponse(
             id=data.get("id", ""),
             filename=data.get("filename", filename),
             status=data.get("status", "pending"),
-            collection_id=data.get("collection_id", collection_id or ""),
+            collection_id=data.get("collection_id", resolved_collection_id or ""),
             message=data.get("message"),
             **metadata,
         )
@@ -946,6 +1615,7 @@ class RagoraClient:
         self,
         file_path: str,
         collection_id: Optional[str] = None,
+        collection: Optional[str] = None,
         relative_path: Optional[str] = None,
         release_tag: Optional[str] = None,
         version: Optional[str] = None,
@@ -957,13 +1627,15 @@ class RagoraClient:
         custom_tags: Optional[list[str]] = None,
         domain: Optional[str] = None,
         scan_mode: Optional[str] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> UploadResponse:
         """
         Upload a file from disk to a collection.
 
         Args:
             file_path: Path to the file on disk
-            collection_id: Target collection ID or slug (uses default if not provided)
+            collection_id: Target collection ID or slug (legacy parameter)
+            collection: Target collection UUID/slug/name or product slug/title
             relative_path: Relative path for directory-style uploads
             release_tag: Release tag for versioned documents
             version: Document version string
@@ -989,6 +1661,7 @@ class RagoraClient:
             file_content=file_content,
             filename=filename,
             collection_id=collection_id,
+            collection=collection,
             relative_path=relative_path,
             release_tag=release_tag,
             version=version,
@@ -1000,19 +1673,30 @@ class RagoraClient:
             custom_tags=custom_tags,
             domain=domain,
             scan_mode=scan_mode,
+            request_options=request_options,
         )
 
-    async def get_document_status(self, document_id: str) -> DocumentStatus:
+    async def get_document_status(
+        self,
+        document_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> DocumentStatus:
         """
         Get the processing status of a document.
 
         Args:
             document_id: Document ID
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             Document status with progress information
         """
-        data, _ = await self._request("GET", f"/v1/documents/{document_id}/status")
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "GET", f"/v1/documents/{document_id}/status",
+            request_id=_rid, timeout=_tout,
+        )
 
         return DocumentStatus(
             id=data.get("id", document_id),
@@ -1033,25 +1717,37 @@ class RagoraClient:
     async def list_documents(
         self,
         collection_id: Optional[str] = None,
+        collection: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        request_options: Optional[RequestOptions] = None,
     ) -> DocumentList:
         """
         List documents in a collection.
 
         Args:
-            collection_id: Collection ID or slug (lists all if not provided)
+            collection_id: Collection ID or slug (legacy parameter)
+            collection: Collection UUID/slug/name or product slug/title
             limit: Number of results per page (max 200)
             offset: Pagination offset
 
         Returns:
             DocumentList with documents and pagination info
         """
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        resolved_collection_id = await self._resolve_single_collection_id(
+            collection=collection,
+            collection_id=collection_id,
+        )
         params: dict[str, Any] = {"limit": limit, "offset": offset}
-        if collection_id:
-            params["collection_id"] = collection_id
+        if resolved_collection_id is not None:
+            params["collection_id"] = resolved_collection_id
 
-        data, metadata = await self._request("GET", "/v1/documents", params=params)
+        data, metadata = await self._request(
+            "GET", "/v1/documents", params=params,
+            request_id=_rid, timeout=_tout,
+        )
 
         documents = [
             Document(
@@ -1081,17 +1777,27 @@ class RagoraClient:
             **metadata,
         )
 
-    async def delete_document(self, document_id: str) -> DeleteResponse:
+    async def delete_document(
+        self,
+        document_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> DeleteResponse:
         """
         Delete a document.
 
         Args:
             document_id: Document ID
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             Deletion confirmation
         """
-        data, _ = await self._request("DELETE", f"/v1/documents/{document_id}")
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "DELETE", f"/v1/documents/{document_id}",
+            request_id=_rid, timeout=_tout,
+        )
 
         return DeleteResponse(
             message=data.get("message", "Document deleted"),
@@ -1104,6 +1810,7 @@ class RagoraClient:
         document_id: str,
         timeout: float = 300.0,
         poll_interval: float = 2.0,
+        request_options: Optional[RequestOptions] = None,
     ) -> DocumentStatus:
         """
         Wait for a document to finish processing.
@@ -1125,7 +1832,7 @@ class RagoraClient:
         start_time = time.time()
 
         while True:
-            status = await self.get_document_status(document_id)
+            status = await self.get_document_status(document_id, request_options=request_options)
 
             if status.status == "completed":
                 return status
@@ -1156,6 +1863,7 @@ class RagoraClient:
         search: Optional[str] = None,
         category: Optional[str] = None,
         trending: bool = False,
+        request_options: Optional[RequestOptions] = None,
     ) -> MarketplaceList:
         """
         List public marketplace products.
@@ -1178,7 +1886,12 @@ class RagoraClient:
         if trending:
             params["trending"] = "true"
 
-        data, metadata = await self._request("GET", "/v1/marketplace", params=params)
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, metadata = await self._request(
+            "GET", "/v1/marketplace", params=params,
+            request_id=_rid, timeout=_tout,
+        )
 
         products = [
             MarketplaceProduct(
@@ -1212,17 +1925,27 @@ class RagoraClient:
             **metadata,
         )
 
-    async def get_marketplace_product(self, product_id: str) -> MarketplaceProduct:
+    async def get_marketplace_product(
+        self,
+        product_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> MarketplaceProduct:
         """
         Get a marketplace product by ID or slug.
 
         Args:
             product_id: Product ID or slug
+            request_options: Per-request options (request_id, timeout)
 
         Returns:
             MarketplaceProduct details
         """
-        data, _ = await self._request("GET", f"/v1/marketplace/{product_id}")
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "GET", f"/v1/marketplace/{product_id}",
+            request_id=_rid, timeout=_tout,
+        )
 
         return MarketplaceProduct(
             id=data.get("id", ""),
@@ -1246,6 +1969,51 @@ class RagoraClient:
 
     # --- Agents ---
 
+    @staticmethod
+    def _map_agent(raw: dict[str, Any]) -> Agent:
+        memory_config = raw.get("memory_config")
+        if not isinstance(memory_config, dict):
+            memory_config = {}
+
+        retrieval_policy = raw.get("retrieval_policy")
+        if not isinstance(retrieval_policy, dict):
+            maybe_from_memory = memory_config.get("retrieval_policy")
+            retrieval_policy = maybe_from_memory if isinstance(maybe_from_memory, dict) else None
+
+        budget_config = raw.get("budget_config")
+        if not isinstance(budget_config, dict):
+            budget_config = {}
+
+        return Agent(
+            id=str(raw.get("id", "")),
+            org_id=str(raw.get("org_id", "")),
+            name=str(raw.get("name", "")),
+            type=str(raw.get("type", "support")),
+            system_prompt=str(raw.get("system_prompt", "")),
+            collection_ids=[str(v) for v in raw.get("collection_ids", []) if isinstance(v, str)],
+            memory_config=memory_config,
+            retrieval_policy=retrieval_policy,
+            budget_config=budget_config,
+            status=str(raw.get("status", "active")),
+            created_at=raw.get("created_at") if isinstance(raw.get("created_at"), str) else None,
+            updated_at=raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
+        )
+
+    @staticmethod
+    def _map_agent_session(raw: dict[str, Any]) -> AgentSession:
+        return AgentSession(
+            id=str(raw.get("id", "")),
+            agent_id=str(raw.get("agent_id", "")),
+            org_id=str(raw.get("org_id", "")),
+            source=str(raw.get("source", "")),
+            source_key=raw.get("source_key") if isinstance(raw.get("source_key"), str) else None,
+            visitor_id=raw.get("visitor_id") if isinstance(raw.get("visitor_id"), str) else None,
+            status=str(raw.get("status", "open")),
+            message_count=raw.get("message_count") if isinstance(raw.get("message_count"), int) else 0,
+            created_at=raw.get("created_at") if isinstance(raw.get("created_at"), str) else None,
+            updated_at=raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
+        )
+
     async def create_agent(
         self,
         name: str,
@@ -1253,22 +2021,11 @@ class RagoraClient:
         type: str = "support",
         system_prompt: Optional[str] = None,
         memory_config: Optional[dict[str, Any]] = None,
+        retrieval_policy: Optional[dict[str, Any]] = None,
         budget_config: Optional[dict[str, Any]] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> Agent:
-        """
-        Create a new agent.
-
-        Args:
-            name: Agent name
-            collection_ids: Collection IDs to link
-            type: Agent type (default: "support")
-            system_prompt: System prompt for the agent
-            memory_config: Memory configuration
-            budget_config: Budget configuration
-
-        Returns:
-            Created agent
-        """
+        """Create a new agent."""
         payload: dict[str, Any] = {
             "name": name,
             "type": type,
@@ -1278,78 +2035,52 @@ class RagoraClient:
             payload["system_prompt"] = system_prompt
         if memory_config is not None:
             payload["memory_config"] = memory_config
+        if retrieval_policy is not None:
+            payload["retrieval_policy"] = retrieval_policy
         if budget_config is not None:
             payload["budget_config"] = budget_config
 
-        data, _ = await self._request("POST", "/v1/agents", json_data=payload)
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "POST", "/v1/agents", json_data=payload,
+            request_id=_rid, timeout=_tout,
+        )
+        return self._map_agent(data)
 
-        return Agent(
-            id=data.get("id", ""),
-            org_id=data.get("org_id", ""),
-            name=data.get("name", ""),
-            type=data.get("type", "support"),
-            system_prompt=data.get("system_prompt", ""),
-            collection_ids=data.get("collection_ids", []),
-            memory_config=data.get("memory_config", {}),
-            budget_config=data.get("budget_config", {}),
-            status=data.get("status", "active"),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at"),
+    async def list_agents(
+        self,
+        request_options: Optional[RequestOptions] = None,
+    ) -> AgentList:
+        """List all agents."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, metadata = await self._request(
+            "GET", "/v1/agents",
+            request_id=_rid, timeout=_tout,
         )
 
-    async def list_agents(self) -> AgentList:
-        """
-        List all agents.
-
-        Returns:
-            AgentList with agents
-        """
-        data, metadata = await self._request("GET", "/v1/agents")
-
+        raw_agents = data.get("agents", [])
         agents = [
-            Agent(
-                id=a.get("id", ""),
-                org_id=a.get("org_id", ""),
-                name=a.get("name", ""),
-                type=a.get("type", "support"),
-                system_prompt=a.get("system_prompt", ""),
-                collection_ids=a.get("collection_ids", []),
-                memory_config=a.get("memory_config", {}),
-                budget_config=a.get("budget_config", {}),
-                status=a.get("status", "active"),
-                created_at=a.get("created_at"),
-                updated_at=a.get("updated_at"),
-            )
-            for a in data.get("agents", [])
+            self._map_agent(agent)
+            for agent in raw_agents
+            if isinstance(agent, dict)
         ]
-
         return AgentList(agents=agents, **metadata)
 
-    async def get_agent(self, agent_id: str) -> Agent:
-        """
-        Get an agent by ID.
-
-        Args:
-            agent_id: Agent ID
-
-        Returns:
-            Agent details
-        """
-        data, _ = await self._request("GET", f"/v1/agents/{agent_id}")
-
-        return Agent(
-            id=data.get("id", ""),
-            org_id=data.get("org_id", ""),
-            name=data.get("name", ""),
-            type=data.get("type", "support"),
-            system_prompt=data.get("system_prompt", ""),
-            collection_ids=data.get("collection_ids", []),
-            memory_config=data.get("memory_config", {}),
-            budget_config=data.get("budget_config", {}),
-            status=data.get("status", "active"),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at"),
+    async def get_agent(
+        self,
+        agent_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> Agent:
+        """Get an agent by ID."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "GET", f"/v1/agents/{agent_id}",
+            request_id=_rid, timeout=_tout,
         )
+        return self._map_agent(data)
 
     async def update_agent(
         self,
@@ -1358,24 +2089,12 @@ class RagoraClient:
         system_prompt: Optional[str] = None,
         collection_ids: Optional[list[str]] = None,
         memory_config: Optional[dict[str, Any]] = None,
+        retrieval_policy: Optional[dict[str, Any]] = None,
         budget_config: Optional[dict[str, Any]] = None,
         status: Optional[str] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> Agent:
-        """
-        Update an agent.
-
-        Args:
-            agent_id: Agent ID
-            name: New name
-            system_prompt: New system prompt
-            collection_ids: New collection IDs
-            memory_config: New memory config
-            budget_config: New budget config
-            status: New status
-
-        Returns:
-            Updated agent
-        """
+        """Update an agent."""
         payload: dict[str, Any] = {}
         if name is not None:
             payload["name"] = name
@@ -1385,39 +2104,33 @@ class RagoraClient:
             payload["collection_ids"] = collection_ids
         if memory_config is not None:
             payload["memory_config"] = memory_config
+        if retrieval_policy is not None:
+            payload["retrieval_policy"] = retrieval_policy
         if budget_config is not None:
             payload["budget_config"] = budget_config
         if status is not None:
             payload["status"] = status
 
-        data, _ = await self._request("PATCH", f"/v1/agents/{agent_id}", json_data=payload)
-
-        return Agent(
-            id=data.get("id", ""),
-            org_id=data.get("org_id", ""),
-            name=data.get("name", ""),
-            type=data.get("type", "support"),
-            system_prompt=data.get("system_prompt", ""),
-            collection_ids=data.get("collection_ids", []),
-            memory_config=data.get("memory_config", {}),
-            budget_config=data.get("budget_config", {}),
-            status=data.get("status", "active"),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at"),
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "PATCH", f"/v1/agents/{agent_id}", json_data=payload,
+            request_id=_rid, timeout=_tout,
         )
+        return self._map_agent(data)
 
-    async def delete_agent(self, agent_id: str) -> DeleteResponse:
-        """
-        Delete an agent.
-
-        Args:
-            agent_id: Agent ID
-
-        Returns:
-            Deletion confirmation
-        """
-        data, _ = await self._request("DELETE", f"/v1/agents/{agent_id}")
-
+    async def delete_agent(
+        self,
+        agent_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> DeleteResponse:
+        """Delete an agent."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, _ = await self._request(
+            "DELETE", f"/v1/agents/{agent_id}",
+            request_id=_rid, timeout=_tout,
+        )
         return DeleteResponse(
             message=data.get("message", "Agent deleted"),
             id=data.get("id", agent_id),
@@ -1428,34 +2141,31 @@ class RagoraClient:
         agent_id: str,
         message: str,
         session_id: Optional[str] = None,
+        collection_ids: Optional[list[str]] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> AgentChatResponse:
-        """
-        Chat with an agent.
-
-        Args:
-            agent_id: Agent ID
-            message: User message
-            session_id: Session ID to continue a conversation
-
-        Returns:
-            AgentChatResponse with assistant message and session ID
-        """
+        """Chat with an agent."""
         payload: dict[str, Any] = {
             "message": message,
             "stream": False,
         }
         if session_id is not None:
             payload["session_id"] = session_id
+        if collection_ids is not None:
+            payload["collection_ids"] = collection_ids
 
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         data, metadata = await self._request(
-            "POST", f"/v1/agents/{agent_id}/chat", json_data=payload
+            "POST", f"/v1/agents/{agent_id}/chat", json_data=payload,
+            request_id=_rid, timeout=_tout,
         )
 
         return AgentChatResponse(
-            message=data.get("message", ""),
-            session_id=data.get("session_id", ""),
-            citations=data.get("citations", []),
-            stats=data.get("stats"),
+            message=str(data.get("message", "")),
+            session_id=str(data.get("session_id", "")),
+            citations=data.get("citations", []) if isinstance(data.get("citations"), list) else [],
+            stats=data.get("stats") if isinstance(data.get("stats"), dict) else None,
             **metadata,
         )
 
@@ -1464,18 +2174,12 @@ class RagoraClient:
         agent_id: str,
         message: str,
         session_id: Optional[str] = None,
+        collection_ids: Optional[list[str]] = None,
+        request_options: Optional[RequestOptions] = None,
     ) -> AsyncIterator[AgentChatStreamChunk]:
-        """
-        Stream a chat with an agent.
-
-        Args:
-            agent_id: Agent ID
-            message: User message
-            session_id: Session ID to continue a conversation
-
-        Yields:
-            AgentChatStreamChunk with content deltas
-        """
+        """Stream a chat with an agent."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         client = await self._ensure_client()
 
         payload: dict[str, Any] = {
@@ -1484,70 +2188,124 @@ class RagoraClient:
         }
         if session_id is not None:
             payload["session_id"] = session_id
+        if collection_ids is not None:
+            payload["collection_ids"] = collection_ids
 
-        async with client.stream(
-            "POST",
-            f"/v1/agents/{agent_id}/chat",
-            json=payload,
-        ) as response:
+        stream_kwargs: dict[str, Any] = {
+            "method": "POST",
+            "url": f"/v1/agents/{agent_id}/chat",
+            "json": payload,
+        }
+        if _rid:
+            stream_kwargs["headers"] = {"X-Request-ID": _rid}
+        if _tout is not None:
+            stream_kwargs["timeout"] = _tout
+
+        async with client.stream(**stream_kwargs) as response:
             if not response.is_success:
                 await response.aread()
                 await self._handle_error(response)
 
-            current_session_id: Optional[str] = None
             event_name = "message"
             data_lines: list[str] = []
+            current_session_id: Optional[str] = None
+
+            def parse_sse_event(
+                current_event: str,
+                current_data_lines: list[str],
+            ) -> tuple[Optional[AgentChatStreamChunk], bool]:
+                nonlocal current_session_id
+
+                if not current_data_lines:
+                    return None, False
+
+                data_str = "\n".join(current_data_lines)
+                if data_str == "[DONE]":
+                    return None, True
+
+                try:
+                    event_payload = json.loads(data_str)
+                except json.JSONDecodeError:
+                    return None, False
+
+                if not isinstance(event_payload, dict):
+                    return None, False
+
+                extracted_session_id = self._extract_stream_session_id(event_payload)
+                if extracted_session_id is not None:
+                    current_session_id = extracted_session_id
+
+                ragora_stats = event_payload.get("ragora_stats")
+                parsed_stats = ragora_stats if isinstance(ragora_stats, dict) else None
+
+                if current_event in {"ragora_status", "ragora.step"}:
+                    step_type = event_payload.get("type")
+                    step_status = event_payload.get("status")
+                    step_message = event_payload.get("message")
+                    return AgentChatStreamChunk(
+                        content="",
+                        session_id=current_session_id,
+                        sources=[],
+                        stats=parsed_stats,
+                        thinking=ThinkingStep(
+                            type=step_type if isinstance(step_type, str) else "working",
+                            message=(
+                                step_status if isinstance(step_status, str)
+                                else step_message if isinstance(step_message, str)
+                                else "Working..."
+                            ),
+                            timestamp=int(time.time() * 1000),
+                        ),
+                        done=False,
+                    ), False
+
+                if current_event == "ragora_metadata":
+                    sources = self._extract_chat_sources(event_payload)
+                    if not sources and current_session_id is None:
+                        return None, False
+                    return AgentChatStreamChunk(
+                        content="",
+                        session_id=current_session_id,
+                        sources=sources,
+                        stats=parsed_stats,
+                        done=False,
+                    ), False
+
+                if current_event == "ragora_complete":
+                    return AgentChatStreamChunk(
+                        content="",
+                        session_id=current_session_id,
+                        sources=self._extract_chat_sources(event_payload),
+                        stats=parsed_stats,
+                        done=True,
+                    ), False
+
+                choices = event_payload.get("choices", [])
+                choice = choices[0] if isinstance(choices, list) and choices else {}
+                if not isinstance(choice, dict):
+                    choice = {}
+                delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    delta = {}
+                content = delta.get("content")
+                if not isinstance(content, str) or content == "":
+                    return None, False
+                return AgentChatStreamChunk(
+                    content=content,
+                    session_id=current_session_id,
+                    sources=[],
+                    done=False,
+                ), False
 
             async for line in response.aiter_lines():
                 if line == "":
-                    if data_lines:
-                        data_str = "\n".join(data_lines)
-                        data_lines = []
-
-                        if data_str == "[DONE]":
-                            event_name = "message"
-                            break
-
-                        try:
-                            parsed = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            event_name = "message"
-                            continue
-
-                        if not isinstance(parsed, dict):
-                            event_name = "message"
-                            continue
-
-                        if event_name in ("ragora_metadata", "ragora_status"):
-                            rs = parsed.get("ragora_stats", {})
-                            if isinstance(rs, dict) and "conversation_id" in rs:
-                                current_session_id = rs["conversation_id"]
-                        elif event_name == "ragora_complete":
-                            rs = parsed.get("ragora_stats", {})
-                            yield AgentChatStreamChunk(
-                                content="",
-                                session_id=current_session_id,
-                                stats=rs if isinstance(rs, dict) else None,
-                                done=True,
-                            )
-                        else:
-                            choices = parsed.get("choices", [])
-                            choice = choices[0] if isinstance(choices, list) and choices else {}
-                            if not isinstance(choice, dict):
-                                choice = {}
-                            delta = choice.get("delta", {})
-                            if not isinstance(delta, dict):
-                                delta = {}
-                            content = delta.get("content", "")
-                            if content is None:
-                                content = ""
-                            if content:
-                                yield AgentChatStreamChunk(
-                                    content=str(content),
-                                    session_id=current_session_id,
-                                )
-
+                    chunk, done = parse_sse_event(event_name, data_lines)
+                    data_lines = []
                     event_name = "message"
+                    if chunk is not None:
+                        yield chunk
+                    if done:
+                        break
                     continue
 
                 if line.startswith("event:"):
@@ -1558,52 +2316,32 @@ class RagoraClient:
                     data_lines.append(line[5:].lstrip())
 
             if data_lines:
-                data_str = "\n".join(data_lines)
-                if data_str != "[DONE]":
-                    try:
-                        parsed = json.loads(data_str)
-                        if isinstance(parsed, dict) and event_name == "ragora_complete":
-                            rs = parsed.get("ragora_stats", {})
-                            yield AgentChatStreamChunk(
-                                content="",
-                                session_id=current_session_id,
-                                stats=rs if isinstance(rs, dict) else None,
-                                done=True,
-                            )
-                    except json.JSONDecodeError:
-                        pass
+                chunk, _ = parse_sse_event(event_name, data_lines)
+                if chunk is not None:
+                    yield chunk
 
-    async def list_agent_sessions(self, agent_id: str) -> AgentSessionList:
-        """
-        List sessions for an agent.
+    async def list_agent_sessions(
+        self,
+        agent_id: str,
+        request_options: Optional[RequestOptions] = None,
+    ) -> AgentSessionList:
+        """List sessions for an agent."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
+        data, metadata = await self._request(
+            "GET", f"/v1/agents/{agent_id}/sessions",
+            request_id=_rid, timeout=_tout,
+        )
 
-        Args:
-            agent_id: Agent ID
-
-        Returns:
-            AgentSessionList with sessions
-        """
-        data, metadata = await self._request("GET", f"/v1/agents/{agent_id}/sessions")
-
+        raw_sessions = data.get("sessions", [])
         sessions = [
-            AgentSession(
-                id=s.get("id", ""),
-                agent_id=s.get("agent_id", ""),
-                org_id=s.get("org_id", ""),
-                source=s.get("source", ""),
-                source_key=s.get("source_key"),
-                visitor_id=s.get("visitor_id"),
-                status=s.get("status", "open"),
-                message_count=s.get("message_count", 0),
-                created_at=s.get("created_at"),
-                updated_at=s.get("updated_at"),
-            )
-            for s in data.get("sessions", [])
+            self._map_agent_session(session)
+            for session in raw_sessions
+            if isinstance(session, dict)
         ]
-
         return AgentSessionList(
             sessions=sessions,
-            total=data.get("total", len(sessions)),
+            total=data.get("total", len(sessions)) if isinstance(data.get("total"), int) else len(sessions),
             **metadata,
         )
 
@@ -1611,49 +2349,33 @@ class RagoraClient:
         self,
         agent_id: str,
         session_id: str,
+        request_options: Optional[RequestOptions] = None,
     ) -> AgentSessionDetail:
-        """
-        Get an agent session with its messages.
-
-        Args:
-            agent_id: Agent ID
-            session_id: Session ID
-
-        Returns:
-            AgentSessionDetail with session and messages
-        """
+        """Get an agent session with its messages."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         data, metadata = await self._request(
-            "GET", f"/v1/agents/{agent_id}/sessions/{session_id}"
+            "GET", f"/v1/agents/{agent_id}/sessions/{session_id}",
+            request_id=_rid, timeout=_tout,
         )
 
-        s = data.get("session", {})
-        session = AgentSession(
-            id=s.get("id", ""),
-            agent_id=s.get("agent_id", ""),
-            org_id=s.get("org_id", ""),
-            source=s.get("source", ""),
-            source_key=s.get("source_key"),
-            visitor_id=s.get("visitor_id"),
-            status=s.get("status", "open"),
-            message_count=s.get("message_count", 0),
-            created_at=s.get("created_at"),
-            updated_at=s.get("updated_at"),
-        )
-
+        raw_session = data.get("session")
+        session = self._map_agent_session(raw_session if isinstance(raw_session, dict) else {})
+        raw_messages = data.get("messages", [])
         messages = [
             AgentMessage(
-                id=m.get("id", ""),
-                session_id=m.get("session_id", ""),
-                role=m.get("role", ""),
-                content=m.get("content", ""),
-                latency_ms=m.get("latency_ms"),
-                cost_usd=m.get("cost_usd"),
-                model=m.get("model"),
-                created_at=m.get("created_at"),
+                id=str(m.get("id", "")),
+                session_id=str(m.get("session_id", "")),
+                role=str(m.get("role", "")),
+                content=str(m.get("content", "")),
+                latency_ms=m.get("latency_ms") if isinstance(m.get("latency_ms"), int) else None,
+                cost_usd=float(m.get("cost_usd")) if isinstance(m.get("cost_usd"), (int, float)) else None,
+                model=m.get("model") if isinstance(m.get("model"), str) else None,
+                created_at=m.get("created_at") if isinstance(m.get("created_at"), str) else None,
             )
-            for m in data.get("messages", [])
+            for m in raw_messages
+            if isinstance(m, dict)
         ]
-
         return AgentSessionDetail(
             session=session,
             messages=messages,
@@ -1664,21 +2386,80 @@ class RagoraClient:
         self,
         agent_id: str,
         session_id: str,
+        request_options: Optional[RequestOptions] = None,
     ) -> DeleteResponse:
-        """
-        Delete/resolve an agent session and clean up its memory.
-
-        Args:
-            agent_id: Agent ID
-            session_id: Session ID
-
-        Returns:
-            Deletion confirmation
-        """
+        """Delete/resolve an agent session and clean up its memory."""
+        _rid = request_options.get("request_id") if request_options else None
+        _tout = request_options.get("timeout") if request_options else None
         data, _ = await self._request(
-            "DELETE", f"/v1/agents/{agent_id}/sessions/{session_id}"
+            "DELETE", f"/v1/agents/{agent_id}/sessions/{session_id}",
+            request_id=_rid, timeout=_tout,
         )
         return DeleteResponse(
             message=data.get("status", "resolved"),
             id=session_id,
         )
+
+    # --- Auto-Pagination Iterators ---
+
+    async def list_collections_iter(
+        self,
+        limit: int = 20,
+        search: Optional[str] = None,
+        request_options: Optional[RequestOptions] = None,
+    ) -> AsyncIterator[Collection]:
+        """Iterate over all collections, automatically handling pagination."""
+        offset = 0
+        while True:
+            page = await self.list_collections(
+                limit=limit, offset=offset, search=search,
+                request_options=request_options,
+            )
+            for item in page.data:
+                yield item
+            if not page.has_more:
+                break
+            offset += page.limit
+
+    async def list_documents_iter(
+        self,
+        collection_id: Optional[str] = None,
+        collection: Optional[str] = None,
+        limit: int = 50,
+        request_options: Optional[RequestOptions] = None,
+    ) -> AsyncIterator[Document]:
+        """Iterate over all documents, automatically handling pagination."""
+        offset = 0
+        while True:
+            page = await self.list_documents(
+                collection_id=collection_id, collection=collection,
+                limit=limit, offset=offset,
+                request_options=request_options,
+            )
+            for item in page.data:
+                yield item
+            if not page.has_more:
+                break
+            offset += page.limit
+
+    async def list_marketplace_iter(
+        self,
+        limit: int = 20,
+        search: Optional[str] = None,
+        category: Optional[str] = None,
+        trending: bool = False,
+        request_options: Optional[RequestOptions] = None,
+    ) -> AsyncIterator[MarketplaceProduct]:
+        """Iterate over all marketplace products, automatically handling pagination."""
+        offset = 0
+        while True:
+            page = await self.list_marketplace(
+                limit=limit, offset=offset, search=search,
+                category=category, trending=trending,
+                request_options=request_options,
+            )
+            for item in page.data:
+                yield item
+            if not page.has_more:
+                break
+            offset += page.limit

@@ -83,8 +83,8 @@ async def main():
 
     # Chat with your knowledge base
     response = await client.chat(
-        collection_id=collection.id,
-        messages=[{"role": "user", "content": "Summarize the main concepts"}]
+        messages=[{"role": "user", "content": "Summarize the main concepts"}],
+        retrieval={"collection_id": collection.id},
     )
     print(response.choices[0].message.content)
 
@@ -201,8 +201,11 @@ results = await client.search(
     collection_id="collection-id",
     query="What is machine learning?",
     top_k=5,              # number of results
-    threshold=0.7,        # minimum relevance score (0-1)
-    filter={"type": "doc"}  # optional metadata filter
+    source_type=["sec_filing"],
+    custom_tags=["ticker:aapl", "form:10-k"],
+    filters={"filing_year": {"$gte": 2023}},
+    version_mode="latest",
+    enable_reranker=True,
 )
 
 for result in results.results:
@@ -217,15 +220,23 @@ for result in results.results:
 ```python
 # Non-streaming
 response = await client.chat(
-    collection_id="collection-id",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Explain RAG"}
     ],
-    model="google/gemini-2.5-flash",    # optional
-    temperature=0.7,         # optional
-    max_tokens=1000,         # optional
-    system_prompt="Custom system prompt"  # optional
+    generation={
+        "model": "google/gemini-2.5-flash",
+        "temperature": 0.7,
+        "max_tokens": 1000,
+    },
+    retrieval={
+        "collection_id": "collection-id",
+        "version_mode": "latest",
+        "document_keys": ["sec:10k:0000320193"],
+        "domain": ["financial"],
+        "domain_filter_mode": "strict",
+        "enable_reranker": True,
+    },
 )
 
 print(response.choices[0].message.content)
@@ -233,14 +244,86 @@ print(f"Sources used: {len(response.sources)}")
 
 # Streaming
 async for chunk in client.chat_stream(
-    collection_id="collection-id",
-    messages=[{"role": "user", "content": "Explain RAG"}]
+    messages=[{"role": "user", "content": "Explain RAG"}],
+    retrieval={"collection_id": "collection-id"},
 ):
     print(chunk.content, end="", flush=True)
 
     # Sources are included in the final chunk
     if chunk.sources:
         print(f"\n\nSources: {len(chunk.sources)}")
+```
+
+`chat()` and `chat_stream()` use grouped options:
+
+- `generation`: model/temperature/max_tokens
+- `retrieval`: collection/product scope + retrieval filters
+- `agentic`: mode/system_prompt/session/session_id
+- `metadata`: source attribution fields
+
+### Friendly Collection/Product References
+
+You can now pass human-friendly names directly:
+
+- `collection`: collection UUID, slug, or name
+- `products`: product UUID, slug, or title
+
+Legacy fields still work:
+
+- `collection_id`
+- `product_ids`
+
+Do not pass both new and legacy fields in the same call.
+
+```python
+# Search by collection name
+results = await client.search(
+    collection="SEC Filings",
+    query="gross margin",
+)
+
+# Chat by product title/slug
+response = await client.chat(
+    messages=[{"role": "user", "content": "Summarize key risks"}],
+    retrieval={"products": ["Apple 10-K Pack"]},
+)
+
+# Upload/list docs by collection name
+upload = await client.upload_file(
+    file_path="./document.pdf",
+    collection="Internal Docs",
+)
+
+documents = await client.list_documents(collection="Internal Docs")
+```
+
+The same retrieval controls (`source_type`, `source_name`, `version`, `version_mode`, `document_keys`, `custom_tags`, `domain`, `domain_filter_mode`, `filters`, `graph_filter`, `temporal_filter`, `enable_reranker`) are available across `search` and `chat` (`chat(..., retrieval={...})`).
+
+### Agent Chat (Auto Retrieval)
+
+```python
+agent = await client.create_agent(
+    name="SEC Analyst",
+    collection_ids=["collection-id"],
+    retrieval_policy={
+        "default_top_k": 8,
+        "max_top_k": 15,
+        "constraints": {
+            "domain": ["financial"],
+            "domain_filter_mode": "strict",
+            "custom_tags": ["ticker:aapl"],
+        },
+    },
+)
+
+reply = await client.agent_chat(
+    agent_id=agent.id,
+    message="Summarize 2024 gross margin drivers for AAPL",
+    session_id="optional-session-id",
+    collection_ids=["collection-id"],  # optional session-level collection scope
+)
+
+print(reply.message)
 ```
 
 ### Marketplace

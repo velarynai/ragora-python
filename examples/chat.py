@@ -24,12 +24,14 @@ async def main():
         print("=== Non-streaming Chat ===\n")
         
         response = await client.chat(
-            collection_id=collection_id,
             messages=[
                 {"role": "user", "content": "What is RAG and how does it work?"}
             ],
-            model="google/gemini-2.5-flash",
-            temperature=0.7,
+            generation={
+                "model": "google/gemini-2.5-flash",
+                "temperature": 0.7,
+            },
+            retrieval={"collection_id": collection_id},
         )
         
         print(f"Assistant: {response.choices[0].message.content}\n")
@@ -51,12 +53,14 @@ async def main():
         
         sources = []
         async for chunk in client.chat_stream(
-            collection_id=collection_id,
             messages=[
                 {"role": "user", "content": "Explain the benefits of using RAG over fine-tuning"}
             ],
-            model="google/gemini-2.5-flash",
-            temperature=0.7,
+            generation={
+                "model": "google/gemini-2.5-flash",
+                "temperature": 0.7,
+            },
+            retrieval={"collection_id": collection_id},
         ):
             print(chunk.content, end="", flush=True)
             

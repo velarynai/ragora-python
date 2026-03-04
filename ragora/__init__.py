@@ -4,7 +4,14 @@ Ragora Python SDK
 A simple, async-first wrapper for the Ragora API.
 """
 
-from .client import RagoraClient
+from .client import (
+    ChatAgenticOptions,
+    ChatGenerationOptions,
+    ChatMetadataOptions,
+    ChatRetrievalOptions,
+    RagoraClient,
+    RequestOptions,
+)
 from .models import (
     APIError,
     Agent,
@@ -15,6 +22,8 @@ from .models import (
     AgentSession,
     AgentSessionDetail,
     AgentSessionList,
+    AuthenticationError,
+    AuthorizationError,
     ChatChoice,
     ChatMessage,
     ChatResponse,
@@ -29,16 +38,27 @@ from .models import (
     Listing,
     MarketplaceList,
     MarketplaceProduct,
+    NotFoundError,
+    RagoraCitation,
+    RagoraExtension,
     RagoraException,
+    RateLimitError,
     SearchResponse,
     SearchResult,
+    ServerError,
+    ThinkingStep,
     UploadResponse,
 )
 
-__version__ = "0.1.2"
+from ._version import __version__  # noqa: F401
 __all__ = [
     # Client
     "RagoraClient",
+    "RequestOptions",
+    "ChatGenerationOptions",
+    "ChatRetrievalOptions",
+    "ChatAgenticOptions",
+    "ChatMetadataOptions",
     # Search
     "SearchResult",
     "SearchResponse",
@@ -47,6 +67,9 @@ __all__ = [
     "ChatChoice",
     "ChatResponse",
     "ChatStreamChunk",
+    "RagoraCitation",
+    "RagoraExtension",
+    "ThinkingStep",
     # Collections
     "Collection",
     "CollectionList",
@@ -74,4 +97,9 @@ __all__ = [
     # Errors
     "APIError",
     "RagoraException",
+    "AuthenticationError",
+    "AuthorizationError",
+    "NotFoundError",
+    "RateLimitError",
+    "ServerError",
 ]

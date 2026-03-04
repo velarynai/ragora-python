@@ -25,9 +25,9 @@ async def main():
         print("Assistant: ", end="", flush=True)
 
         async for chunk in client.chat_stream(
-            collection_id=collection_id,
             messages=[{"role": "user", "content": "Explain how RAG works in 3 sentences."}],
-            temperature=0.7,
+            generation={"temperature": 0.7},
+            retrieval={"collection_id": collection_id},
         ):
             # Print each token as it arrives
             print(chunk.content, end="", flush=True)
