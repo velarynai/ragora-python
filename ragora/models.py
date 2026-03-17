@@ -32,6 +32,8 @@ class SearchResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict, description="Document metadata")
     document_id: Optional[str] = Field(None, description="Parent document ID")
     collection_id: Optional[str] = Field(None, description="Collection ID")
+    page_number: Optional[int] = Field(None, description="Page number in source document")
+    section_heading: Optional[str] = Field(None, description="Section heading for the chunk")
 
 
 class SearchResponse(ResponseMetadata):

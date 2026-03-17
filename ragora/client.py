@@ -346,6 +346,8 @@ class RagoraClient:
                     metadata=metadata,
                     document_id=raw.get("document_id"),
                     collection_id=raw.get("collection_id"),
+                    page_number=raw.get("page_number") or metadata.get("page_number"),
+                    section_heading=raw.get("section_heading") or metadata.get("section_heading"),
                 )
             )
 
